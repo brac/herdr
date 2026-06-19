@@ -238,6 +238,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                         }
                     }
                 }
+                // Phase 3c: throbber while a fire-and-forget push/pull runs.
+                if let Some(path) = &group.path {
+                    if let Some(label) = app.git_op_label(path) {
+                        header_spans.push(Span::styled(
+                            format!("  {label}"),
+                            Style::default().fg(t.status_processing),
+                        ));
+                    }
+                }
                 let mut cells: Vec<Cell> =
                     vec![Cell::from(""), Cell::from(Line::from(header_spans))];
                 for _ in 2..11 {

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -258,6 +259,35 @@ fn compact_value(value: &str, empty_label: &str) -> String {
 /// current without spawning a `git` per project on every tick.
 const GIT_STATUS_TTL: Duration = Duration::from_secs(10);
 
+/// A push or pull (Phase 3c). The verb feeds status messages and the throbber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitOpKind {
+    Push,
+    Pull,
+}
+
+impl GitOpKind {
+    /// The `git` subcommand.
+    fn arg(self) -> &'static str {
+        match self {
+            GitOpKind::Push => "push",
+            GitOpKind::Pull => "pull",
+        }
+    }
+    /// Human verb for status/throbber text.
+    pub fn verb(self) -> &'static str {
+        self.arg()
+    }
+}
+
+/// An in-flight fire-and-forget git push/pull for one project (Phase 3c, §4).
+/// The render loop polls `child` with `try_wait()`; `started` drives the throbber.
+pub struct GitOp {
+    pub kind: GitOpKind,
+    child: Child,
+    started: Instant,
+}
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -270,6 +300,9 @@ pub struct App {
     /// Per-project git status (Phase 3), keyed by project path with the instant
     /// it was computed. Throttled by `GIT_STATUS_TTL`; see `refresh_git_cache`.
     pub git_cache: HashMap<PathBuf, (Instant, GitStatus)>,
+    /// In-flight fire-and-forget push/pull per project (Phase 3c). Polled each
+    /// refresh via `try_wait`; drives the throbber while present.
+    pub git_ops: HashMap<PathBuf, GitOp>,
     pub table_state: TableState,
     pub should_quit: bool,
     pub status_msg: String,
@@ -560,6 +593,7 @@ impl App {
             projects: Vec::new(),
             include_non_git: false,
             git_cache: HashMap::new(),
+            git_ops: HashMap::new(),
             table_state: TableState::default(),
             should_quit: false,
             status_msg: String::new(),
@@ -696,6 +730,7 @@ impl App {
         // Project-first roster: scan the parent dir for project directories.
         // Cheap local read; projects exist independent of agents (§2).
         self.projects = projects::scan(&self.parent_dir, self.include_non_git);
+        self.poll_git_ops();
         self.refresh_git_cache();
 
         // Discover which PIDs have session files
@@ -1161,6 +1196,86 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Phase 3c (CLAUDE.md §4): fire-and-forget `git push`/`pull` into the
+    /// selected project. Spawns with null stdio and returns immediately — the
+    /// render loop never blocks on the network. The result lands on a later
+    /// refresh via `poll_git_ops`. Re-pressing while one is in flight is a no-op.
+    pub fn start_git_op(&mut self, kind: GitOpKind) {
+        let Some(path) = self.selected_launch_cwd() else {
+            self.status_msg = "No project selected".into();
+            return;
+        };
+        let name = project_label(&path);
+
+        if self.git_ops.contains_key(&path) {
+            self.status_msg = format!("git {} already running in {name}", kind.verb());
+            return;
+        }
+
+        match Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .arg(kind.arg())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.status_msg = format!("git {} started in {name}…", kind.verb());
+                self.git_ops.insert(
+                    path,
+                    GitOp {
+                        kind,
+                        child,
+                        started: Instant::now(),
+                    },
+                );
+            }
+            Err(e) => self.status_msg = format!("git {} failed to start: {e}", kind.verb()),
+        }
+    }
+
+    /// Reap finished push/pull children (non-blocking `try_wait`). On completion,
+    /// drop the op and evict the project's cached git status so the next
+    /// `refresh_git_cache` recomputes fresh ahead/behind. Errors count as done.
+    fn poll_git_ops(&mut self) {
+        if self.git_ops.is_empty() {
+            return;
+        }
+        let mut done: Vec<(PathBuf, GitOpKind, bool)> = Vec::new();
+        for (path, op) in self.git_ops.iter_mut() {
+            match op.child.try_wait() {
+                Ok(Some(status)) => done.push((path.clone(), op.kind, status.success())),
+                Ok(None) => {} // still running
+                Err(_) => done.push((path.clone(), op.kind, false)),
+            }
+        }
+        for (path, kind, ok) in done {
+            self.git_ops.remove(&path);
+            self.git_cache.remove(&path); // force a fresh status next refresh
+            let name = project_label(&path);
+            self.status_msg = if ok {
+                format!("git {} done: {name}", kind.verb())
+            } else {
+                format!("git {} failed: {name}", kind.verb())
+            };
+        }
+    }
+
+    /// Whether any push/pull is in flight (drives throbber repaints in main.rs).
+    pub fn git_op_active(&self) -> bool {
+        !self.git_ops.is_empty()
+    }
+
+    /// Throbber label for an in-flight op on `path` (e.g. "⠹ push"), or `None`.
+    pub fn git_op_label(&self, path: &Path) -> Option<String> {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let op = self.git_ops.get(path)?;
+        let frame = (op.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
+        Some(format!("{} {}", FRAMES[frame], op.kind.verb()))
     }
 
     fn apply_sort(&self, sessions: &mut [ClaudeSession]) {
@@ -2531,6 +2646,16 @@ impl App {
                 self.cancel_pending_auto_approve();
                 self.enter_launch_mode();
             }
+            (KeyCode::Char('P'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.start_git_op(GitOpKind::Push);
+            }
+            (KeyCode::Char('L'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.start_git_op(GitOpKind::Pull);
+            }
             (KeyCode::Char('g'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
@@ -3126,6 +3251,13 @@ pub struct ProjectGroup {
     pub urgency: u8,
 }
 
+/// Short display name for a project path (its final component), for status text.
+fn project_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// Actionability rank for roster ordering (from agent-deck): a blocked agent is
 /// more urgent than a busy or expensive one. Lower sorts first.
 fn status_urgency(status: SessionStatus) -> u8 {
@@ -3651,6 +3783,104 @@ mod tests {
         assert_eq!(git.branch, "main");
         assert!(git.dirty);
         assert_eq!(git.ahead, 2);
+    }
+
+    #[test]
+    fn git_op_kind_maps_to_subcommand_and_verb() {
+        assert_eq!(GitOpKind::Push.arg(), "push");
+        assert_eq!(GitOpKind::Pull.arg(), "pull");
+        assert_eq!(GitOpKind::Push.verb(), "push");
+        assert_eq!(GitOpKind::Pull.verb(), "pull");
+    }
+
+    #[test]
+    fn project_label_uses_final_path_component() {
+        assert_eq!(project_label(Path::new("/tmp/foo/bar")), "bar");
+        assert_eq!(project_label(Path::new("/tmp/foo bar")), "foo bar");
+    }
+
+    #[test]
+    fn start_git_op_with_no_selection_is_a_noop() {
+        // Phase 3c: nothing selected → no child spawned, just a status message.
+        let mut app = App::new();
+        app.projects = Vec::new();
+        app.sessions = Vec::new();
+        app.table_state.select(None);
+        app.start_git_op(GitOpKind::Push);
+        assert!(!app.git_op_active(), "no op should be spawned without a target");
+        assert!(app.status_msg.contains("No project"));
+    }
+
+    /// End-to-end (hermetic, no network): pressing push pushes a new commit to a
+    /// local bare remote. Proves the spawn → try_wait reap path. Skipped if `git`
+    /// is unavailable.
+    #[test]
+    fn push_propagates_a_commit_to_a_local_remote() {
+        use std::path::Path;
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        let git = |dir: &Path, args: &[&str]| {
+            Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&origin)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("clone")
+            .arg(&origin)
+            .arg(&work)
+            .output()
+            .unwrap();
+        git(&work, &["config", "user.email", "t@example.com"]);
+        git(&work, &["config", "user.name", "t"]);
+
+        // First commit + establish upstream (manual, outside our code path).
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "first"]);
+        git(&work, &["push", "-u", "origin", "HEAD"]);
+
+        // A second commit our push must deliver.
+        std::fs::write(work.join("b.txt"), "2").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "second"]);
+
+        let mut app = App::new();
+        // App::new() discovers real sessions; clear them so the only roster row
+        // is our "work" project (otherwise an "(other)" bucket sorts above it).
+        app.sessions = Vec::new();
+        app.projects = vec![Project {
+            path: work.clone(),
+            name: "work".into(),
+            has_git: true,
+        }];
+        app.table_state.select(Some(0)); // the "work" project header
+        assert_eq!(app.selected_launch_cwd(), Some(work.clone()));
+
+        app.start_git_op(GitOpKind::Push);
+        assert!(app.git_op_active(), "push should be in flight");
+
+        // Reap with a bounded wait (try_wait is non-blocking).
+        for _ in 0..200 {
+            app.poll_git_ops();
+            if !app.git_op_active() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!app.git_op_active(), "push should finish within the timeout");
+
+        // The local branch should no longer be ahead of its upstream.
+        let ahead = git(&work, &["rev-list", "--count", "@{u}..HEAD"]);
+        let ahead = String::from_utf8_lossy(&ahead.stdout).trim().to_string();
+        assert_eq!(ahead, "0", "second commit should have been pushed to origin");
     }
 
     #[test]

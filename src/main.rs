@@ -184,5 +184,12 @@ fn run<W: io::Write>(
             last_tick = Instant::now();
             needs_redraw = true;
         }
+
+        // Phase 3c: while a push/pull is in flight, keep repainting so the
+        // throbber animates (the CHANNEL_POLL cadence is the frame rate). The
+        // op's result is reaped by the safety-net tick's refresh.
+        if app.git_op_active() {
+            needs_redraw = true;
+        }
     }
 }

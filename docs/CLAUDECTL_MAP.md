@@ -48,8 +48,10 @@ herdr/
 
 ### 1. Session discovery — `core/discovery.rs`
 - `scan_sessions() -> Vec<ClaudeSession>` — reads `~/.claude/projects/<slug>/`; entry point.
-- `cwd_to_slug(cwd)` (`discovery.rs:263`) — **the path hash. Inherit, never re-derive (§8).**
-  Trims trailing `/`, replaces `/` → `-`: `/Users/foo/bar` → `-Users-foo-bar`. Has unit tests.
+- `cwd_to_slug(cwd)` (`discovery.rs:263`) — **the path hash. Inherit, never re-derive loosely (§8).**
+  Trims trailing `/`, then replaces **every non-ASCII-alphanumeric char** with `-`, preserving case:
+  `/Users/foo/bar` → `-Users-foo-bar`, `/.../Ben Bracamonte/...` → `-...-Ben-Bracamonte-...`. (The
+  original `/`-only version was a latent bug — see the "Discovery fix" section below.) Has unit tests.
 - `resolve_jsonl_paths()` — three-priority `--resume` fallback (own ID → resume UUID → newest `.jsonl`).
 - `scan_subagents()`, `resolve_worktree_ids()` — subagent rollups + git-worktree identity.
 - `projects_dir()` — `~/.claude/projects`.
@@ -229,3 +231,31 @@ to 2s. **Threads + channels only — no tokio, no async** (§3 amended to sancti
   `-D warnings` clean. The true "watch an agent type and see the roster move" is a manual step needing a
   live agent in WSL/tmux.
 - **Unblocks Phase 3:** git status rides the safety-net tick (not file-watched); see `PHASE3_PLAN.md`.
+
+## Phase 3 — git light path (CLAUDE.md §4, PHASE3_PLAN.md) — DONE
+
+Branch/dirty/ahead-behind per project, plus fire-and-forget push/pull. Shell out
+to the `git` binary, parse stdout — no `git2`/libgit2, no diff/staging/rebase (§8).
+
+- **3a — `core/git.rs`:** `GitStatus { branch, dirty, ahead, behind, upstream, bare }`
+  + pure `parse_porcelain_v2()` + `status()` (one `git status --porcelain=v2 --branch`
+  spawn; a second `rev-parse` only on failure, to render `(bare)` vs `None`). Defensive:
+  failures → `None`, unknown lines ignored. Bare-repo guard from agent-deck's `isBareRepoSelf`.
+- **3b — roster wiring:** `App.git_cache` (10s TTL, pruned, rides the safety-net tick — git
+  is *not* file-watched) → `ProjectGroup.git`; the header renders `branch · ● dirty · ↑ahead
+  ↓behind` themed (NO_COLOR respected). **Actionability sort** (agent-deck): active projects
+  order by most-urgent agent (NeedsInput > Processing > … > cost), so a blocked agent floats up.
+- **3c — push/pull:** `P`/`L` spawn `git -C {project} push|pull` with null stdio (never blocks the
+  loop); `App.git_ops` tracks the `Child`, reaped each refresh via non-blocking `try_wait()`. On
+  completion the project's cached status is evicted so the next refresh shows fresh ahead/behind.
+  A hand-rolled braille throbber shows while in flight (main.rs forces repaints via `git_op_active`).
+  No confirm modal (v1); no `tui-overlay`/`throbber-widgets-tui` dep (held the size line). Help
+  overlay documents `P`/`L`.
+- **Verified:** live `~/Work` shows real glances — `herdr [main ●]` (agents nested, slug fix
+  paying off), `paperHands [main ● ↑19]`, `fallenFour [master ●]`, `agent-deck [main]` clean. Push
+  is proven by a **hermetic E2E test** (local bare remote, no network): press push → a new commit
+  lands on origin and the branch is no longer ahead.
+- **Green:** **153 tests** (128 core incl. 11 git + 25 tui + 3 watcher); clippy `-D warnings` clean;
+  release binary **1.55 MB**; **no new dependencies** (the git path is pure shell-out).
+- **Deferred (not gate):** confirm-on-push modal; a `tui-overlay` drawer; richer git detail (it's a
+  glance by design — full git is "open a tmux pane running gitui", §4).

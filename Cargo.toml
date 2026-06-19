@@ -23,6 +23,14 @@ claudectl-core = { path = "crates/claudectl-core" }
 claudectl-tui = { path = "crates/claudectl-tui" }
 ratatui = "0.30"
 crossterm = "0.29"
+# Phase 2.5 (CLAUDE.md §3, EVENT_LOOP_PLAN.md): event-driven refresh. A watcher
+# thread on ~/.claude/projects feeds an mpsc channel so agent activity repaints
+# the roster without waiting for the safety-net tick. Threads only — no tokio.
+notify = "8"
+
+[dev-dependencies]
+# Phase 2.5 watcher integration test only.
+tempfile = "3"
 
 # Inherited from claudectl (CLAUDE.md §3): small, fast, panic-safe binary.
 [profile.release]

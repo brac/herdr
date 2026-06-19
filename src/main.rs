@@ -23,11 +23,23 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use claudectl_core::discovery;
 use claudectl_tui::{app::App, ui};
 
-/// Poll cadence. Local filesystem reads are <1ms, so a 2s tick keeps the
-/// roster fresh without busy-spinning (CLAUDE.md §3; matches upstream).
+mod watcher;
+
+/// Safety-net refresh cadence. With the Phase 2.5 watcher driving most refreshes
+/// off filesystem events, this is the fallback tick that still fires when no
+/// event arrives — keeping timer-driven state (CPU/MEM enrichment, elapsed
+/// clocks, the Phase 3 git-status throttle) current (CLAUDE.md §3).
 const TICK_RATE: Duration = Duration::from_secs(2);
+
+/// How often the loop wakes to drain the watcher channel. crossterm's
+/// `event::poll` only wakes on terminal input, not our mpsc channel, so we use a
+/// short input timeout as the channel's poll granularity: a file event is picked
+/// up within this window. Keys are still handled instantly (poll returns as soon
+/// as input arrives). Cheap — an empty drain is a no-op (CLAUDE.md §3).
+const CHANNEL_POLL: Duration = Duration::from_millis(200);
 
 fn main() -> io::Result<()> {
     let opts = Options::from_args();
@@ -103,42 +115,74 @@ fn run<W: io::Write>(
     // sessions, defaulting to MockRuntime — so there is no orchestrator wiring
     // to do here (cf. upstream `run_tui`, which swaps in a live brain/coord/bus
     // runtime — deliberately omitted).
-    let mut app = App::with_parent(opts.parent);
+    let mut app = App::with_parent(opts.parent.clone());
     if opts.include_non_git {
         app.include_non_git = true;
         app.refresh(); // re-scan now that the widen flag is set
     }
+
+    // Phase 2.5: event-driven refresh. The watcher feeds `watch_rx`; if it can't
+    // start we get `None` and fall back to pure timed polling (§3). `_watcher`
+    // must stay in scope for the whole loop — dropping it stops the thread.
+    let watch = watcher::spawn(&discovery::projects_dir(), &opts.parent);
+    let (watch_rx, _watcher) = match watch {
+        Some((rx, w)) => (Some(rx), Some(w)),
+        None => (None, None),
+    };
+
     let mut last_tick = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            // Skills overlay is the one full-screen panel we vendored. Upstream
-            // also has a Brain Review screen, but its renderer lives in the
-            // binary crate we didn't fork; opening it simply falls through to
-            // the roster (Esc returns) rather than rendering a missing screen.
-            if app.show_skills {
-                ui::skills::render_skills_screen(frame, area, &app);
-                return;
-            }
-            ui::table::render(frame, area, &app);
-        })?;
+        if needs_redraw {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                // Skills overlay is the one full-screen panel we vendored.
+                // Upstream also has a Brain Review screen, but its renderer lives
+                // in the binary crate we didn't fork; opening it simply falls
+                // through to the roster (Esc returns) rather than a missing screen.
+                if app.show_skills {
+                    ui::skills::render_skills_screen(frame, area, &app);
+                    return;
+                }
+                ui::table::render(frame, area, &app);
+            })?;
+            needs_redraw = false;
+        }
 
-        let timeout = TICK_RATE
+        // Wake at least every CHANNEL_POLL to drain the watcher channel, but no
+        // later than the next safety-net tick. Keys return from poll instantly.
+        let until_tick = TICK_RATE
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO);
+        let timeout = until_tick.min(CHANNEL_POLL);
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if !app.handle_key(key) {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if !app.handle_key(key) {
+                        return Ok(());
+                    }
+                    needs_redraw = true;
                 }
+                // Resize/mouse/etc. — repaint so the new geometry takes effect.
+                _ => needs_redraw = true,
             }
         }
 
-        if last_tick.elapsed() >= TICK_RATE {
+        // Coalesce a burst of filesystem events into a single refresh.
+        let mut fs_dirty = false;
+        if let Some(rx) = &watch_rx {
+            while rx.try_recv().is_ok() {
+                fs_dirty = true;
+            }
+        }
+
+        // Refresh on a filesystem event or when the safety-net tick elapses.
+        if fs_dirty || last_tick.elapsed() >= TICK_RATE {
             app.tick();
             last_tick = Instant::now();
+            needs_redraw = true;
         }
     }
 }

@@ -79,6 +79,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
+            Span::styled("  o              ", Style::default().fg(t.highlight_key)),
+            Span::raw("  Show the selected agent in the split (swaps the one visible; o again hides it)"),
+        ]),
+        Line::from(vec![
             Span::styled("  C              ", Style::default().fg(t.highlight_key)),
             Span::raw("  Open the selected agent's conversation (oatmeal chat; type to reply, ↑↓ scroll, Esc close)"),
         ]),

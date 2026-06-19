@@ -483,6 +483,9 @@ pub struct App {
     /// Whether this terminal can inject keystrokes into agent panes (computed
     /// once at startup). False outside tmux/Kitty on WSL → chat is read-only.
     pub input_supported: bool,
+    /// The tmux pane id of the agent currently shown in herdr's split "stage"
+    /// (only one at a time). `o` swaps it; launches replace it. None = nothing staged.
+    pub staged_pane: Option<String>,
     /// Which tab is currently active inside the brain overlay.
     pub brain_tab: BrainTab,
     /// Currently selected index into `brain_queue`.
@@ -750,6 +753,7 @@ impl App {
             chat_scroll: 0,
             chat_input: String::new(),
             input_supported: terminals::supports_input(),
+            staged_pane: None,
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
             brain_queue: Vec::new(),
@@ -2891,6 +2895,11 @@ impl App {
                 self.cancel_pending_auto_approve();
                 self.enter_launch_mode();
             }
+            (KeyCode::Char('o'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.stage_selected();
+            }
             (KeyCode::Char('P'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
@@ -2988,13 +2997,70 @@ impl App {
             .selected_launch_cwd()
             .unwrap_or_else(|| self.parent_dir.clone());
         let cwd = cwd.to_string_lossy().into_owned();
+
+        // One agent visible at a time: break out whatever's currently staged so
+        // the new one replaces it in the bottom split rather than stacking.
+        let in_tmux = std::env::var("TMUX_PANE").is_ok();
+        if in_tmux {
+            if let Some(prev) = self.staged_pane.take() {
+                let _ = terminals::unstage_pane(&prev);
+            }
+        }
+
         let result = launch::prepare(&cwd, None, None).and_then(|req| {
             launch::launch(&req).map(|target| (target, req.cwd_path.display().to_string()))
         });
         self.status_msg = match result {
-            Ok((target, path)) => format!("Launched agent in {target} at {path}"),
+            Ok((target, path)) => {
+                // In tmux, `target` is the new pane id — track it as the stage.
+                if in_tmux {
+                    self.staged_pane = Some(target);
+                }
+                format!("Launched agent at {path}")
+            }
             Err(err) => format!("Launch failed: {err}"),
         };
+    }
+
+    /// Swap the bottom split "stage" to show the selected agent's pane (one at a
+    /// time). Pressing `o` on the already-staged agent hides it. tmux only.
+    fn stage_selected(&mut self) {
+        let (pid, tty, remote) = match self.selected_session() {
+            Some(s) => (s.pid, s.tty.clone(), s.is_remote()),
+            None => {
+                self.status_msg = "Select an agent to view in the split".into();
+                return;
+            }
+        };
+        let _ = pid;
+        if remote {
+            self.status_msg = "Remote session — not available".into();
+            return;
+        }
+        let Some(pane) = terminals::agent_pane(&tty) else {
+            self.status_msg = "Agent pane not found — is it running inside tmux?".into();
+            return;
+        };
+
+        // Toggle off if this agent is already the staged one.
+        if self.staged_pane.as_deref() == Some(pane.as_str()) {
+            let _ = terminals::unstage_pane(&pane);
+            self.staged_pane = None;
+            self.status_msg = "Hid the agent pane".into();
+            return;
+        }
+
+        let previous = self.staged_pane.take();
+        match terminals::stage_pane(&pane, previous.as_deref()) {
+            Ok(()) => {
+                self.staged_pane = Some(pane);
+                self.status_msg = "Viewing agent (Ctrl-b ↓ to type · o to hide)".into();
+            }
+            Err(e) => {
+                // `previous` was already broken out by stage_pane on the tmux path.
+                self.status_msg = format!("View failed: {e}");
+            }
+        }
     }
 
     fn enter_launch_mode(&mut self) {
@@ -3021,12 +3087,21 @@ impl App {
             }
         };
 
+        let in_tmux = std::env::var("TMUX_PANE").is_ok();
+        if in_tmux {
+            if let Some(prev) = self.staged_pane.take() {
+                let _ = terminals::unstage_pane(&prev);
+            }
+        }
         match launch::launch(&request) {
             Ok(target) => {
                 self.launch_mode = false;
                 self.launch_form = LaunchForm::default();
+                if in_tmux {
+                    self.staged_pane = Some(target);
+                }
                 self.status_msg = format!(
-                    "Launched session in {target} at {}{}",
+                    "Launched session at {}{}",
                     request.cwd_path.display(),
                     request.option_summary()
                 );

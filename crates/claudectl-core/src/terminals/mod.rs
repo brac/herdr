@@ -972,6 +972,37 @@ pub fn format_doctor_report(report: &DoctorReport) -> String {
     lines.join("\n")
 }
 
+/// Resolve the tmux pane id for an agent's tty, or `None` when not in tmux / not
+/// found. Used by the single-stage split view.
+pub fn agent_pane(tty: &str) -> Option<String> {
+    if matches!(detect_terminal(), Terminal::Tmux) {
+        tmux::pane_for_tty(tty)
+    } else {
+        None
+    }
+}
+
+/// Show `target` (a tmux pane id) as the single agent pane below herdr: break out
+/// the `previous` staged pane (if any) first, so only one is ever visible.
+pub fn stage_pane(target: &str, previous: Option<&str>) -> Result<(), String> {
+    if !matches!(detect_terminal(), Terminal::Tmux) {
+        return Err("Split view requires running herdr inside tmux".into());
+    }
+    if let Some(prev) = previous {
+        let _ = tmux::break_out(prev);
+    }
+    tmux::join_into_herdr(target)
+}
+
+/// Hide a staged pane (break it back out to its own window). No-op outside tmux.
+pub fn unstage_pane(pane: &str) -> Result<(), String> {
+    if matches!(detect_terminal(), Terminal::Tmux) {
+        tmux::break_out(pane)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn launch_session(
     cwd: &str,
     prompt: Option<&str>,

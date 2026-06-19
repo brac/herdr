@@ -14,7 +14,15 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     // taking over a separate window. Target herdr's own pane via $TMUX_PANE so
     // the split lands here even if another pane is active. tmux owns the layout
     // from here (zoom with `prefix z`, rearrange as you like).
-    let mut args: Vec<String> = vec!["split-window".into(), "-v".into()];
+    // Split herdr's pane and print the new pane id so the caller can track it as
+    // the single "staged" agent (see stage/unstage below).
+    let mut args: Vec<String> = vec![
+        "split-window".into(),
+        "-v".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}".into(),
+    ];
     if let Ok(pane) = std::env::var("TMUX_PANE") {
         args.push("-t".into());
         args.push(pane);
@@ -29,7 +37,60 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
         .map_err(|e| format!("tmux split-window failed: {e}"))?;
 
     if output.status.success() {
-        Ok("tmux split pane".into())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Resolve an agent's tmux pane id (`%N`) by matching its tty. Stable across
+/// pane moves (the pty stays with the process), so it's safe to re-resolve.
+pub fn pane_for_tty(tty: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_tty} #{pane_id}"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some((pane_tty, pane_id)) = line.split_once(' ') {
+            if pane_tty.contains(tty) {
+                return Some(pane_id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Move `pane` into herdr's window as the bottom split (the single agent
+/// "stage"), keeping focus on herdr. Targets herdr's own pane via `$TMUX_PANE`.
+pub fn join_into_herdr(pane: &str) -> Result<(), String> {
+    let herdr = std::env::var("TMUX_PANE").map_err(|_| "herdr is not running inside tmux".to_string())?;
+    if pane == herdr {
+        return Err("that pane is herdr itself".into());
+    }
+    let output = std::process::Command::new("tmux")
+        .args(["join-pane", "-v", "-l", "60%", "-s", pane, "-t", &herdr])
+        .output()
+        .map_err(|e| format!("tmux join-pane failed: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    // Keep driving from herdr; Ctrl-b ↓ to type into the agent.
+    let _ = std::process::Command::new("tmux")
+        .args(["select-pane", "-t", &herdr])
+        .output();
+    Ok(())
+}
+
+/// Break `pane` out of herdr's window back to its own background window, so it's
+/// preserved but no longer visible (only one agent staged at a time).
+pub fn break_out(pane: &str) -> Result<(), String> {
+    let output = std::process::Command::new("tmux")
+        .args(["break-pane", "-d", "-s", pane])
+        .output()
+        .map_err(|e| format!("tmux break-pane failed: {e}"))?;
+    if output.status.success() {
+        Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }

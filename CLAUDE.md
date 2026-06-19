@@ -16,13 +16,31 @@ projects, shows what Claude Code agents are doing inside each, launches new agen
 light git status. Built on a fork of `claudectl`.
 
 **Is NOT:**
-- A window manager. **tmux does splits, navigation, and pane lifecycle.** We never reimplement that.
+- A window manager / terminal multiplexer. **We never reimplement tmux** — no VT/PTY parsing, no
+  ANSI rendering, no layout engine in Rust. **We may *compose* tmux**, though: herdr drives
+  `split-window` / `join-pane` / `break-pane` / `resize-pane` to launch agents into a pane and to
+  keep a **single "stage"** agent visible below the roster, swappable as you navigate (the `o` key).
+  That is calling tmux to arrange panes, not building our own multiplexer. (This is a deliberate
+  evolution past the original "passive overlay in a pane the user split" stance — see §0.1.)
 - A git client. We **shell out** to `git` for light status and fire-and-forget push/pull.
   We do **not** vendor `git2`/libgit2, and we do **not** reimplement staging/diffing. If the user
   wants full interactive git, the answer is "open a tmux pane running gitui," not "build gitui here."
-- A session-lifecycle owner like `claude-dashboard`. We do not create/name/attach tmux sessions
-  *for* the user as our core job. We launch agents into panes and observe; tmux owns the rest.
+- A session-lifecycle owner like `claude-dashboard`. We do not create/name/attach tmux *sessions*,
+  nor manage their lifecycle. We launch agents into **panes/windows** of the user's existing session
+  and observe; the user (and tmux) own the session itself.
 - An async application. No tokio. See §3.
+
+### 0.1 The tmux-orchestration line (amended)
+
+Originally herdr was to be a *passive* smart overlay: the user splits panes; herdr only fills them.
+That line moved. herdr now **actively orchestrates panes via tmux commands** for two features:
+**launch-into-split** (`n`/`N` → `split-window`, replacing any staged agent) and the
+**single-agent stage** (`o` → `join-pane`/`break-pane` so exactly one agent is visible below the
+roster, plus `resize-pane` to auto-fit herdr's height). The discipline that survives: **compose
+tmux, never reimplement it.** No PTY/VT handling, no layout math beyond "ask tmux for N rows." If a
+feature would need us to *render* a terminal or *track* pane geometry ourselves, STOP — that's the
+real line (§8). Conversation *reading* still goes through the JSONL reconstruction (`C`); live
+*interaction* and native rendering happen in the real tmux pane.
 
 ---
 
@@ -178,9 +196,13 @@ Strip the claudectl orchestrator/rules engine during Phase 0/1 unless a phase ex
 ## 8. Scope tripwires (stop and flag if you find yourself doing these)
 
 - Pulling in `git2`/libgit2 or building any diff/staging UI → STOP. Light path only.
-- Adding tokio/async-std → STOP. Synchronous poll loop only.
-- Creating/owning tmux sessions as a primary feature → STOP. tmux owns lifecycle.
-- Reimplementing the `cwd → slug` hash → STOP. Inherit claudectl's.
+- Adding tokio/async-std → STOP. Synchronous poll loop + background threads only (§3).
+- Creating/owning/naming tmux **sessions**, or managing session lifecycle → STOP. We orchestrate
+  **panes/windows** within the user's session (§0.1), never the session itself.
+- **Rendering a terminal or tracking pane geometry ourselves** (a VT/PTY parser, an ANSI renderer,
+  computing layouts beyond "ask tmux for N rows") → STOP. Compose tmux; don't reimplement it (§0.1).
+- Reimplementing the `cwd → slug` hash → STOP. Inherit claudectl's (fixed to hyphenate *all*
+  non-alphanumerics — see `discovery.rs` + the map's "Discovery fix").
 - Designing graph content before the spine works → STOP. Defer to Phase 5.
 - Any new dependency without a one-line justification in the PR → STOP.
 

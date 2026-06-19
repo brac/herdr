@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
@@ -254,18 +254,6 @@ fn compact_value(value: &str, empty_label: &str) -> String {
     }
 }
 
-/// Background-sweep cadence for an **idle** project's git status. Git state
-/// changes rarely (a commit, branch switch, or edit) and computing it on the
-/// `/mnt/c` mount is real work, so idle repos only refresh occasionally — this
-/// is an ambient glance, not a live feed. The selected project refreshes faster
-/// (`GIT_STATUS_TTL_FOCUS`), and an in-app push/pull updates instantly.
-const GIT_STATUS_TTL: Duration = Duration::from_secs(60);
-
-/// Faster cadence for the **selected** project so the repo you're looking at
-/// stays current (e.g. right after you commit in a tmux pane). Short, but still
-/// throttled so scrolling `j/k` past a row doesn't spawn a `git` each time.
-const GIT_STATUS_TTL_FOCUS: Duration = Duration::from_secs(5);
-
 /// A push or pull (Phase 3c). The verb feeds status messages and the throbber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitOpKind {
@@ -332,13 +320,15 @@ pub struct App {
     pub projects: Vec<Project>,
     /// Widen the project scan to non-git subdirectories (default false = .git only).
     pub include_non_git: bool,
-    /// Per-project git status (Phase 3), keyed by project path with the instant
-    /// it was computed. Throttled by `GIT_STATUS_TTL`; see `refresh_git_cache`.
-    pub git_cache: HashMap<PathBuf, (Instant, GitStatus)>,
+    /// Per-project git status (Phase 3), keyed by project path. A present key
+    /// means "fetched" (`Some` = status, `None` = no status / failed), so we
+    /// never auto-refetch a project we already have. Event-driven only — no TTL,
+    /// no periodic sweep (see `refresh_git_cache` / `enqueue_git`).
+    pub git_cache: HashMap<PathBuf, Option<GitStatus>>,
     /// Background worker that computes `git status` off the render thread (§3).
     git_svc: GitStatusService,
     /// Projects whose status request is in flight on the worker — avoids
-    /// re-enqueuing the same path every refresh while it's being computed.
+    /// re-enqueuing the same path while it's being computed.
     git_inflight: HashSet<PathBuf>,
     /// In-flight fire-and-forget push/pull per project (Phase 3c). Polled each
     /// refresh via `try_wait`; drives the throbber while present.
@@ -1202,61 +1192,74 @@ impl App {
         }
     }
 
-    /// Refresh the per-project git-status cache (Phase 3 light path) **without
-    /// blocking the render thread** (§3). Each call: drain any results the
-    /// background worker has produced into the cache, prune vanished projects,
-    /// then enqueue stale (missing or older than `GIT_STATUS_TTL`) non-in-flight
-    /// projects for the worker to compute. `git status` itself runs on the
-    /// worker — see `GitStatusService` — so this stays O(channel ops), even when
-    /// every repo is on the slow `/mnt/c` mount. Cheap; fine to call every tick.
+    /// Drain the background git worker into the cache and fetch any **not-yet-
+    /// fetched** project (CLAUDE.md §3/§4). This is the only place that runs every
+    /// refresh, and it is **not** periodic polling: a project is enqueued here
+    /// exactly once — when it first appears (startup or a newly cloned repo) and
+    /// has no cache entry. Re-fetches are event-driven elsewhere: landing on a
+    /// row (`next`/`previous`), an in-app push/pull, or manual `r`. O(channel ops);
+    /// `git status` itself runs on the worker, never on the render thread.
     fn refresh_git_cache(&mut self) {
-        let now = Instant::now();
         let live: HashSet<PathBuf> = self
             .projects
             .iter()
             .filter(|p| p.has_git)
             .map(|p| p.path.clone())
             .collect();
-        // The project under the cursor gets the faster refresh cadence.
-        let focus = self.selected_launch_cwd();
 
-        // Drain completed background results into the cache.
+        // Drain completed background results into the cache. A present key (even
+        // `None`) marks the project fetched, so we don't re-request it below.
         while let Ok((path, status)) = self.git_svc.res_rx.try_recv() {
             self.git_inflight.remove(&path);
-            match status {
-                Some(st) => {
-                    self.git_cache.insert(path, (now, st));
-                }
-                None => {
-                    self.git_cache.remove(&path);
-                }
-            }
+            self.git_cache.insert(path, status);
         }
 
         // Drop state for projects that vanished.
         self.git_cache.retain(|path, _| live.contains(path));
         self.git_inflight.retain(|path| live.contains(path));
 
-        // Enqueue stale, not-already-in-flight projects for background compute.
-        // The selected project uses the shorter focus TTL; idle ones the slow
-        // sweep — so we're not spawning `git` for every repo every few seconds.
-        for path in &live {
-            if self.git_inflight.contains(path) {
-                continue;
-            }
-            let ttl = if focus.as_ref() == Some(path) {
-                GIT_STATUS_TTL_FOCUS
-            } else {
-                GIT_STATUS_TTL
-            };
-            let stale = self
-                .git_cache
-                .get(path)
-                .map(|(t, _)| now.duration_since(*t) >= ttl)
-                .unwrap_or(true);
-            if stale && self.git_svc.req_tx.send(path.clone()).is_ok() {
-                self.git_inflight.insert(path.clone());
-            }
+        // One-time fetch for projects we've never fetched (initial populate +
+        // newly discovered repos). Cached projects are never re-enqueued here —
+        // that's what keeps idle repos from generating any periodic `git` churn.
+        let unfetched: Vec<PathBuf> = live
+            .into_iter()
+            .filter(|p| !self.git_cache.contains_key(p) && !self.git_inflight.contains(p))
+            .collect();
+        for path in unfetched {
+            self.enqueue_git(&path);
+        }
+    }
+
+    /// Request a fresh `git status` for one project on the background worker.
+    /// Bypasses the cache (used for on-demand re-fetch: selection, push/pull,
+    /// manual refresh) but dedups against in-flight requests.
+    fn enqueue_git(&mut self, path: &Path) {
+        if self.git_inflight.contains(path) {
+            return;
+        }
+        if self.git_svc.req_tx.send(path.to_path_buf()).is_ok() {
+            self.git_inflight.insert(path.to_path_buf());
+        }
+    }
+
+    /// Re-fetch git status for the project under the cursor (called on row
+    /// navigation — "passing over a row polls it"). No-op when nothing's selected.
+    fn enqueue_selected_git(&mut self) {
+        if let Some(path) = self.selected_launch_cwd() {
+            self.enqueue_git(&path);
+        }
+    }
+
+    /// Re-fetch every git project (manual full refresh, `r`).
+    fn enqueue_all_git(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .filter(|p| p.has_git)
+            .map(|p| p.path.clone())
+            .collect();
+        for path in paths {
+            self.enqueue_git(&path);
         }
     }
 
@@ -1317,7 +1320,7 @@ impl App {
         }
         for (path, kind, ok) in done {
             self.git_ops.remove(&path);
-            self.git_cache.remove(&path); // force a fresh status next refresh
+            self.enqueue_git(&path); // re-fetch status so ahead/behind updates
             let name = project_label(&path);
             self.status_msg = if ok {
                 format!("git {} done: {name}", kind.verb())
@@ -2036,6 +2039,7 @@ impl App {
             None => 0,
         };
         self.table_state.select(Some(i));
+        self.enqueue_selected_git(); // landing on a row re-fetches its git status
     }
 
     pub fn previous(&mut self) {
@@ -2049,6 +2053,7 @@ impl App {
             None => 0,
         };
         self.table_state.select(Some(i));
+        self.enqueue_selected_git(); // landing on a row re-fetches its git status
     }
 
     pub fn selected_session(&self) -> Option<&ClaudeSession> {
@@ -2618,6 +2623,7 @@ impl App {
             (KeyCode::Char('r'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
+                self.enqueue_all_git(); // manual refresh re-fetches every repo's git
                 self.refresh();
             }
             (KeyCode::Char('R'), _) => {
@@ -3406,7 +3412,7 @@ impl App {
                 proj.has_git,
                 &members,
             );
-            group.git = self.git_cache.get(&proj.path).map(|(_, st)| st.clone());
+            group.git = self.git_cache.get(&proj.path).cloned().flatten();
             result.push(group);
         }
 
@@ -3814,7 +3820,7 @@ mod tests {
 
     #[test]
     fn project_groups_attaches_cached_git_status() {
-        // Phase 3b: project_groups() copies git status from the throttled cache.
+        // Phase 3b: project_groups() copies git status from the cache.
         let mut app = App::new();
         let path = PathBuf::from("/tmp/repo");
         app.projects = vec![Project {
@@ -3824,17 +3830,14 @@ mod tests {
         }];
         app.git_cache.insert(
             path,
-            (
-                Instant::now(),
-                GitStatus {
-                    branch: "main".into(),
-                    dirty: true,
-                    ahead: 2,
-                    behind: 0,
-                    upstream: true,
-                    bare: false,
-                },
-            ),
+            Some(GitStatus {
+                branch: "main".into(),
+                dirty: true,
+                ahead: 2,
+                behind: 0,
+                upstream: true,
+                bare: false,
+            }),
         );
         let groups = app.project_groups();
         let repo = groups.iter().find(|g| g.name == "repo").unwrap();
@@ -3880,6 +3883,54 @@ mod tests {
             app.git_inflight.len(),
             2,
             "both stale projects should be queued on the background worker"
+        );
+    }
+
+    #[test]
+    fn cached_git_project_is_not_re_fetched_on_refresh() {
+        // The core "no periodic polling" guarantee: once a project's git status
+        // is fetched, plain refreshes (ticks / fs events) never re-request it.
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        let path = PathBuf::from("/nonexistent/repo");
+        app.projects = vec![Project {
+            path: path.clone(),
+            name: "r".into(),
+            has_git: true,
+        }];
+        app.git_inflight.clear();
+        app.git_cache.clear();
+        app.git_cache.insert(path.clone(), Some(GitStatus::default()));
+
+        app.refresh_git_cache();
+
+        assert!(
+            app.git_inflight.is_empty(),
+            "a cached project must not be re-fetched on refresh (no periodic polling)"
+        );
+    }
+
+    #[test]
+    fn navigating_onto_a_row_re_fetches_its_git_status() {
+        // "Passing over a row polls it" — even if already cached.
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        let path = PathBuf::from("/nonexistent/repo");
+        app.projects = vec![Project {
+            path: path.clone(),
+            name: "r".into(),
+            has_git: true,
+        }];
+        app.git_inflight.clear();
+        app.git_cache.clear();
+        app.git_cache.insert(path.clone(), Some(GitStatus::default()));
+        app.table_state.select(None);
+
+        app.next(); // lands on the project header
+
+        assert!(
+            app.git_inflight.contains(&path),
+            "landing on a row should re-fetch its git status"
         );
     }
 
@@ -3971,7 +4022,7 @@ mod tests {
             if !app.git_op_active() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert!(!app.git_op_active(), "push should finish within the timeout");
 

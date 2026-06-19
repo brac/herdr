@@ -279,3 +279,26 @@ Gap that let it through: tests ran `git` on one `/tmp` repo (fast); the example
 did a single non-looping refresh, so the periodic freeze never surfaced.
 Regression guard added: `git_status_is_fetched_off_thread_not_inline` asserts
 `refresh_git_cache` enqueues rather than populating the cache inline. 154 tests.
+
+## Phase 3 follow-up 2 — git status is fully event-driven (no polling at all)
+
+The tiered-TTL sweep (idle 60s / focus 5s) was still periodic polling — the same
+smell the watcher removed from agent status. Replaced with **purely event-driven**
+git status: **no TTL, no timer ever re-fetches a repo.** `git_cache` is now
+`HashMap<PathBuf, Option<GitStatus>>` (key present = fetched; `Some`/`None` =
+status/failed). A project's status is (re)fetched on the background worker only on:
+1. **First appearance** — `refresh_git_cache` enqueues any project with no cache
+   entry (initial populate + newly cloned repos). Cached projects are never
+   re-enqueued here, so an idle roster generates **zero** background `git`.
+2. **Landing on its row** — `next`/`previous` call `enqueue_selected_git` ("passing
+   over a row polls it"), re-fetching even if cached.
+3. **In-app push/pull completion** — `poll_git_ops` re-enqueues that project.
+4. **Manual `r`** — `enqueue_all_git` re-fetches every repo.
+
+All fetches dedup via `git_inflight` and run on the worker thread (never blocks).
+Guards: `cached_git_project_is_not_re_fetched_on_refresh` (no periodic polling) and
+`navigating_onto_a_row_re_fetches_its_git_status`. Supersedes the 10s/60s TTL notes
+above. 156 tests; clippy clean.
+
+Note: an agent actively editing files in a **non-selected** repo won't update its
+dirty flag until you land on it or press `r` — an accepted trade for zero idle churn.

@@ -1,0 +1,11 @@
+# Enforce LF line endings repo-wide. This repo is frequently edited from WSL on a
+# Windows (/mnt/c) mount; without this, editors rewrite files to CRLF and flood
+# every diff with phantom churn. text=auto + eol=lf normalizes on commit/checkout.
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.lock  text eol=lf
+*.sh    text eol=lf

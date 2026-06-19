@@ -254,11 +254,17 @@ fn compact_value(value: &str, empty_label: &str) -> String {
     }
 }
 
-/// How long a project's cached git status stays fresh before recompute. Git
-/// status rides the safety-net tick — it is *not* file-watched (watching ~53
-/// `.git` trees isn't worth it; PHASE3_PLAN.md) — so a 10s TTL keeps the glance
-/// current without spawning a `git` per project on every tick.
-const GIT_STATUS_TTL: Duration = Duration::from_secs(10);
+/// Background-sweep cadence for an **idle** project's git status. Git state
+/// changes rarely (a commit, branch switch, or edit) and computing it on the
+/// `/mnt/c` mount is real work, so idle repos only refresh occasionally — this
+/// is an ambient glance, not a live feed. The selected project refreshes faster
+/// (`GIT_STATUS_TTL_FOCUS`), and an in-app push/pull updates instantly.
+const GIT_STATUS_TTL: Duration = Duration::from_secs(60);
+
+/// Faster cadence for the **selected** project so the repo you're looking at
+/// stays current (e.g. right after you commit in a tmux pane). Short, but still
+/// throttled so scrolling `j/k` past a row doesn't spawn a `git` each time.
+const GIT_STATUS_TTL_FOCUS: Duration = Duration::from_secs(5);
 
 /// A push or pull (Phase 3c). The verb feeds status messages and the throbber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,6 +1217,8 @@ impl App {
             .filter(|p| p.has_git)
             .map(|p| p.path.clone())
             .collect();
+        // The project under the cursor gets the faster refresh cadence.
+        let focus = self.selected_launch_cwd();
 
         // Drain completed background results into the cache.
         while let Ok((path, status)) = self.git_svc.res_rx.try_recv() {
@@ -1230,14 +1238,21 @@ impl App {
         self.git_inflight.retain(|path| live.contains(path));
 
         // Enqueue stale, not-already-in-flight projects for background compute.
+        // The selected project uses the shorter focus TTL; idle ones the slow
+        // sweep — so we're not spawning `git` for every repo every few seconds.
         for path in &live {
             if self.git_inflight.contains(path) {
                 continue;
             }
+            let ttl = if focus.as_ref() == Some(path) {
+                GIT_STATUS_TTL_FOCUS
+            } else {
+                GIT_STATUS_TTL
+            };
             let stale = self
                 .git_cache
                 .get(path)
-                .map(|(t, _)| now.duration_since(*t) >= GIT_STATUS_TTL)
+                .map(|(t, _)| now.duration_since(*t) >= ttl)
                 .unwrap_or(true);
             if stale && self.git_svc.req_tx.send(path.clone()).is_ok() {
                 self.git_inflight.insert(path.clone());

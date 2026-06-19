@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/claudectl-core", "crates/claudectl-tui"]
+resolver = "3"
+
+[package]
+name = "herdr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A project-first terminal cockpit for operating Claude Code agents across a tree of repos."
+license = "MIT"
+repository = "https://github.com/brac/herdr"
+
+[[bin]]
+name = "herdr"
+path = "src/main.rs"
+
+[dependencies]
+# The lean data + render layer, vendored from claudectl (see NOTICE). The
+# brain / bus / coord orchestrator crates from upstream are deliberately not
+# vendored; this binary drives the TUI against an in-memory MockRuntime.
+claudectl-core = { path = "crates/claudectl-core" }
+claudectl-tui = { path = "crates/claudectl-tui" }
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Inherited from claudectl (CLAUDE.md §3): small, fast, panic-safe binary.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

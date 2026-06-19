@@ -1,0 +1,17 @@
+herdr
+======
+
+herdr is a fork of claudectl (https://github.com/mercurialsolo/claudectl),
+licensed under the MIT License, Copyright (c) 2026 mercurialsolo.
+
+The crates under `crates/claudectl-core` and `crates/claudectl-tui` are
+vendored from claudectl at commit:
+
+    9c15a506452fc6df499c9241d2373256c2135197  (v0.57.2-8-g9c15a506)
+
+Only the lean, synchronous data + render layer was vendored. The upstream
+brain / bus / coord orchestrator (the root binary crate's `src/brain`,
+`src/bus`, `src/coord` modules, which depend on tokio + rmcp + rusqlite) was
+deliberately excluded. See CLAUDE.md §1 and the Phase 0 plan for rationale.
+
+The original MIT license text is retained in LICENSE.

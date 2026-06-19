@@ -662,7 +662,7 @@ impl App {
         #[cfg(feature = "coord")]
         app.coord_refresh();
         app.refresh();
-        if app.visible_session_count() > 0 {
+        if app.roster_len() > 0 {
             app.table_state.select(Some(0));
         }
         app
@@ -1796,7 +1796,9 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        let len = self.visible_session_count();
+        // Navigate over roster rows (headers + agents), not just agents, so idle
+        // projects are reachable (CLAUDE.md §2).
+        let len = self.roster_len();
         if len == 0 {
             return;
         }
@@ -1809,7 +1811,7 @@ impl App {
     }
 
     pub fn previous(&mut self) {
-        let len = self.visible_session_count();
+        let len = self.roster_len();
         if len == 0 {
             return;
         }
@@ -1822,10 +1824,14 @@ impl App {
     }
 
     pub fn selected_session(&self) -> Option<&ClaudeSession> {
-        let visible = self.visible_session_indices();
         let selected = self.table_state.selected()?;
-        let session_idx = *visible.get(selected)?;
-        self.sessions.get(session_idx)
+        let (_, rows) = self.roster_layout();
+        match rows.get(selected)? {
+            RosterRow::Agent(si) => self.sessions.get(*si),
+            // A project header is selected — no agent. Callers (kill, switch,
+            // input, detail) degrade gracefully on None (CLAUDE.md §2).
+            RosterRow::Header(_) => None,
+        }
     }
 
     pub fn handle_kill(&mut self) {
@@ -2550,7 +2556,15 @@ impl App {
 
     fn enter_launch_mode(&mut self) {
         self.launch_mode = true;
-        self.launch_form = LaunchForm::default();
+        // Project-first (CLAUDE.md §2, Phase 2): pre-fill the launch cwd from the
+        // selected project (or the selected agent's project), so `n` launches
+        // into wherever the cursor sits — including an idle, zero-agent repo.
+        // Falls back to the CLI default (".") when nothing is selected.
+        let mut form = LaunchForm::default();
+        if let Some(cwd) = self.selected_launch_cwd() {
+            form.cwd = cwd.to_string_lossy().into_owned();
+        }
+        self.launch_form = form;
         self.status_msg = self.launch_form.status_hint();
     }
 
@@ -2651,7 +2665,7 @@ impl App {
     }
 
     fn normalize_selection(&mut self) {
-        let len = self.visible_session_count();
+        let len = self.roster_len();
         if len == 0 {
             self.table_state.select(None);
         } else if self.table_state.selected().is_none() {
@@ -3030,6 +3044,17 @@ impl App {
     }
 }
 
+/// One navigable line in the project-first roster (CLAUDE.md §2). The selection
+/// ordinal (`App::table_state`) indexes a `Vec<RosterRow>`, so project headers —
+/// including idle, zero-agent projects — are selectable, not just agents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterRow {
+    /// A project header. Indexes the `groups` vec returned by `roster_layout`.
+    Header(usize),
+    /// An agent row. Indexes `App::sessions`.
+    Agent(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectGroup {
     pub name: String,
@@ -3141,6 +3166,61 @@ impl App {
                 .then_with(|| a.name.cmp(&b.name))
         });
         result
+    }
+
+    /// The canonical roster ordering shared by selection and render (CLAUDE.md
+    /// §2). Grouped view: a `Header` per project group (in `project_groups`
+    /// order) followed by that group's agents; flat view: just the visible
+    /// agents. The returned groups back the `Header` indices so the renderer and
+    /// the selection logic never drift. This is the single source of truth for
+    /// what `table_state` selects.
+    pub fn roster_layout(&self) -> (Vec<ProjectGroup>, Vec<RosterRow>) {
+        if self.grouped_view {
+            let groups = self.project_groups();
+            let mut rows = Vec::new();
+            for (gi, group) in groups.iter().enumerate() {
+                rows.push(RosterRow::Header(gi));
+                for &pid in &group.pids {
+                    if let Some(si) = self.sessions.iter().position(|s| s.pid == pid) {
+                        rows.push(RosterRow::Agent(si));
+                    }
+                }
+            }
+            (groups, rows)
+        } else {
+            let rows = self
+                .visible_session_indices()
+                .into_iter()
+                .map(RosterRow::Agent)
+                .collect();
+            (Vec::new(), rows)
+        }
+    }
+
+    /// Number of navigable roster rows (headers + agents). Selection navigation
+    /// and clamping operate over this, not the bare session count.
+    pub fn roster_len(&self) -> usize {
+        self.roster_layout().1.len()
+    }
+
+    /// Working directory to launch a new agent into, derived from the current
+    /// selection (CLAUDE.md §2, Phase 2): the selected project (header), the
+    /// project owning the selected agent, or — for an out-of-tree agent with no
+    /// owning project — that agent's own cwd. `None` when nothing is selected.
+    pub fn selected_launch_cwd(&self) -> Option<PathBuf> {
+        let selected = self.table_state.selected()?;
+        let (groups, rows) = self.roster_layout();
+        match rows.get(selected)? {
+            RosterRow::Header(gi) => groups.get(*gi).and_then(|g| g.path.clone()),
+            RosterRow::Agent(si) => {
+                let s = self.sessions.get(*si)?;
+                groups
+                    .iter()
+                    .find(|g| g.pids.contains(&s.pid))
+                    .and_then(|g| g.path.clone())
+                    .or_else(|| Some(PathBuf::from(&s.cwd)))
+            }
+        }
     }
 }
 
@@ -3320,6 +3400,10 @@ mod tests {
                 false,
             ),
         ];
+        // Deterministic roster regardless of where tests run: no scanned
+        // projects, so the four sessions group under the synthetic "(other)"
+        // header (grouped view is the default).
+        app.projects = Vec::new();
         app.budget_usd = Some(5.0);
         app.context_warn_threshold = 75;
         app.conflict_pids.insert(13);
@@ -3356,18 +3440,123 @@ mod tests {
     }
 
     #[test]
-    fn normalize_selection_clamps_to_filtered_session_count() {
+    fn normalize_selection_clamps_to_filtered_roster_count() {
         let mut app = make_test_app();
+        // Grouped roster after filtering to NeedsInput: [Header(other), Agent(11)].
         app.table_state.select(Some(3));
         app.status_filter = StatusFilter::NeedsInput;
         app.normalize_selection();
-        assert_eq!(app.table_state.selected(), Some(0));
+        // Clamps to the last roster row — the surviving agent, not its header.
+        assert_eq!(app.table_state.selected(), Some(1));
         assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
     }
 
-    #[test]
-    fn launch_wizard_starts_with_cli_defaults() {
+    /// Build an app whose grouped roster is deterministic: one active project
+    /// ("alpha", hosting agent 11), one idle project ("idle", no agents). Roster
+    /// order is `[Header(alpha), Agent(11), Header(idle)]` (active projects sort
+    /// before idle ones).
+    fn make_grouped_app() -> App {
         let mut app = App::new();
+        app.grouped_view = true;
+        app.sessions = vec![make_session(
+            11,
+            "alpha",
+            "sonnet-4.6",
+            SessionStatus::Processing,
+            2.0,
+            40.0,
+            true,
+        )];
+        app.projects = vec![
+            Project {
+                path: PathBuf::from("/tmp/alpha"),
+                name: "alpha".into(),
+                has_git: true,
+            },
+            Project {
+                path: PathBuf::from("/tmp/idle"),
+                name: "idle".into(),
+                has_git: true,
+            },
+        ];
+        app.table_state.select(None);
+        app
+    }
+
+    #[test]
+    fn roster_layout_places_header_then_its_agents() {
+        let app = make_grouped_app();
+        let (groups, rows) = app.roster_layout();
+        assert_eq!(
+            rows,
+            vec![
+                RosterRow::Header(0),
+                RosterRow::Agent(0),
+                RosterRow::Header(1),
+            ]
+        );
+        // Active project sorts before the idle one; idle project still present.
+        assert_eq!(groups[0].name, "alpha");
+        assert_eq!(groups[0].session_count, 1);
+        assert_eq!(groups[1].name, "idle");
+        assert_eq!(groups[1].session_count, 0);
+    }
+
+    #[test]
+    fn selected_session_is_none_on_a_header_and_some_on_an_agent() {
+        let mut app = make_grouped_app();
+        app.table_state.select(Some(0)); // alpha header
+        assert!(app.selected_session().is_none());
+        app.table_state.select(Some(1)); // agent 11
+        assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
+        app.table_state.select(Some(2)); // idle header
+        assert!(app.selected_session().is_none());
+    }
+
+    #[test]
+    fn selected_launch_cwd_targets_project_for_headers_and_agents() {
+        let mut app = make_grouped_app();
+        // Header of the active project → that project's path.
+        app.table_state.select(Some(0));
+        assert_eq!(
+            app.selected_launch_cwd(),
+            Some(PathBuf::from("/tmp/alpha"))
+        );
+        // The agent row → its owning project's path, not the bare cwd.
+        app.table_state.select(Some(1));
+        assert_eq!(
+            app.selected_launch_cwd(),
+            Some(PathBuf::from("/tmp/alpha"))
+        );
+        // Idle, zero-agent project header → launchable (the Phase 2 headline).
+        app.table_state.select(Some(2));
+        assert_eq!(app.selected_launch_cwd(), Some(PathBuf::from("/tmp/idle")));
+    }
+
+    #[test]
+    fn navigation_reaches_the_idle_project_header() {
+        let mut app = make_grouped_app();
+        app.table_state.select(Some(0));
+        app.next(); // → agent 11
+        app.next(); // → idle header
+        assert_eq!(app.table_state.selected(), Some(2));
+        assert!(app.selected_session().is_none());
+        assert_eq!(app.selected_launch_cwd(), Some(PathBuf::from("/tmp/idle")));
+    }
+
+    #[test]
+    fn enter_launch_mode_prefills_cwd_from_selected_project() {
+        let mut app = make_grouped_app();
+        app.table_state.select(Some(2)); // idle project
+        app.enter_launch_mode();
+        assert!(app.launch_mode);
+        assert_eq!(app.launch_form.cwd, "/tmp/idle");
+    }
+
+    #[test]
+    fn launch_wizard_defaults_to_dot_with_no_selection() {
+        let mut app = App::new();
+        app.table_state.select(None); // nothing selected → CLI default
         app.enter_launch_mode();
 
         assert!(app.launch_mode);

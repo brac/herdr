@@ -1,14 +1,16 @@
-//! Non-interactive proof of the Phase 1 project-first roster.
+//! Non-interactive proof of the project-first roster (Phases 1 and 2).
 //!
-//! Builds the App against a parent dir (default current dir, or argv[1]),
-//! and prints the project roster: every project appears whether or not it
-//! hosts agents, with live agents nested under their project. TTY-free, so it
-//! validates the §2 inversion without driving the full TUI.
+//! Builds the App against a parent dir (default current dir, or argv[1]), and
+//! prints the project roster: every project appears whether or not it hosts
+//! agents, with live agents nested under their project (Phase 1). It then prints
+//! the *navigable* roster — the rows the cursor can land on — to show that
+//! project headers, including idle zero-agent ones, are selectable so `n` can
+//! launch an agent into any of them (Phase 2). TTY-free.
 //! Run: `cargo run --example projects -- ~/Work`
 
 use std::path::PathBuf;
 
-use claudectl_tui::app::App;
+use claudectl_tui::app::{App, RosterRow};
 
 fn main() {
     let parent = std::env::args()
@@ -48,5 +50,29 @@ fn main() {
 
     if !idle.is_empty() {
         println!("\nidle projects ({}): {}", idle.len(), idle.join(", "));
+    }
+
+    // Phase 2 (CLAUDE.md §2): the navigable roster — every row the cursor can
+    // land on. Headers (even idle, zero-agent projects) are selectable rows, so
+    // `n` launches an agent into wherever the cursor sits.
+    let (groups, rows) = app.roster_layout();
+    println!("\nnavigable roster — {} selectable rows:", rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            RosterRow::Header(gi) => {
+                let g = &groups[*gi];
+                let kind = if g.session_count == 0 {
+                    "project (idle)"
+                } else {
+                    "project"
+                };
+                println!("  [{i:>2}] {kind:<14} {}", g.name);
+            }
+            RosterRow::Agent(si) => {
+                if let Some(s) = app.sessions.get(*si) {
+                    println!("  [{i:>2}] {:<14} └ {} {}", "agent", s.pid, s.status);
+                }
+            }
+        }
     }
 }

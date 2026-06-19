@@ -17,11 +17,11 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
-crossterm = "0.28"
+crossterm = "0.29"
 # theme.rs uses ratatui::style::Color. Pulling the whole ratatui crate is a
 # touch heavier than we'd like — when claudectl-tui is extracted (#275) theme
 # may move with it and we can drop this dep.
-ratatui = "0.29"
+ratatui = "0.30"
 
 [dev-dependencies]
 tempfile = "3"

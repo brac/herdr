@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
-use crate::app::{App, SORT_COLUMNS};
+use crate::app::{App, RosterRow, SORT_COLUMNS};
 use claudectl_core::session::{ClaudeSession, SessionStatus, SubagentBreakdown, SubagentState};
 
 use super::detail::render_detail_panel;
@@ -167,76 +167,65 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let header = Row::new(header_cells).height(1);
 
-    let selected_pid = app.selected_session().map(|s| s.pid);
+    // Project-first roster (CLAUDE.md §2): `roster_layout` is the single source
+    // of truth for row order and selection — a header per project group followed
+    // by its agents (grouped view), or just the visible agents (flat view).
+    // `table_state` selects a roster ordinal, so we map the selected ordinal to
+    // its first visual row (a session can expand into subagent rows).
+    let (groups, roster) = app.roster_layout();
+    let selected_roster = app.table_state.selected();
     let mut selected_row_idx = None;
-    let rows: Vec<Row> = if app.grouped_view {
-        let groups = app.project_groups();
-        let mut rows = Vec::new();
-        let mut row_idx = 0usize;
-        for group in &groups {
-            // Group header row
-            let cost_str = if group.total_cost < 1.0 {
-                format!("${:.2}", group.total_cost)
-            } else {
-                format!("${:.1}", group.total_cost)
-            };
-            // Idle projects (no agents) render as just the dim project name —
-            // the absence of child rows conveys "no agents", and the narrow
-            // Project column can't fit more. Git status gets its own column in
-            // the Phase 3 light path. Active projects show the full aggregate.
-            let header_text = if group.session_count == 0 {
-                group.name.clone()
-            } else {
-                format!(
-                    "{} ({} sessions, {} active, {}, ctx {:.0}%)",
-                    group.name,
-                    group.session_count,
-                    group.active_count,
-                    cost_str,
-                    group.avg_context_pct
-                )
-            };
-            let header_style = if group.session_count == 0 {
-                Style::default().fg(t.header).add_modifier(Modifier::DIM)
-            } else {
-                Style::default().fg(t.header).add_modifier(Modifier::BOLD)
-            };
-            let mut cells: Vec<Cell> =
-                vec![Cell::from(""), Cell::from(header_text).style(header_style)];
-            for _ in 2..11 {
-                cells.push(Cell::from(""));
-            }
-            rows.push(Row::new(cells));
-            row_idx += 1;
-
-            // Session rows under this group
-            for s in visible_sessions
-                .iter()
-                .copied()
-                .filter(|s| group.pids.contains(&s.pid))
-            {
-                if Some(s.pid) == selected_pid {
-                    selected_row_idx = Some(row_idx);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut visual_idx = 0usize;
+    for (ri, entry) in roster.iter().enumerate() {
+        if Some(ri) == selected_roster {
+            selected_row_idx = Some(visual_idx);
+        }
+        match entry {
+            RosterRow::Header(gi) => {
+                let group = &groups[*gi];
+                let cost_str = if group.total_cost < 1.0 {
+                    format!("${:.2}", group.total_cost)
+                } else {
+                    format!("${:.1}", group.total_cost)
+                };
+                // Idle projects (no agents) render as just the dim project name —
+                // the absence of child rows conveys "no agents", and the narrow
+                // Project column can't fit more. Git status gets its own column
+                // in the Phase 3 light path. Active projects show the aggregate.
+                let header_text = if group.session_count == 0 {
+                    group.name.clone()
+                } else {
+                    format!(
+                        "{} ({} sessions, {} active, {}, ctx {:.0}%)",
+                        group.name,
+                        group.session_count,
+                        group.active_count,
+                        cost_str,
+                        group.avg_context_pct
+                    )
+                };
+                let header_style = if group.session_count == 0 {
+                    Style::default().fg(t.header).add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(t.header).add_modifier(Modifier::BOLD)
+                };
+                let mut cells: Vec<Cell> =
+                    vec![Cell::from(""), Cell::from(header_text).style(header_style)];
+                for _ in 2..11 {
+                    cells.push(Cell::from(""));
                 }
+                rows.push(Row::new(cells));
+                visual_idx += 1;
+            }
+            RosterRow::Agent(si) => {
+                let s = &app.sessions[*si];
                 let session_rows = render_rows_for_session(s, app);
-                row_idx += session_rows.len();
+                visual_idx += session_rows.len();
                 rows.extend(session_rows);
             }
         }
-        rows
-    } else {
-        let mut rows = Vec::new();
-        let mut row_idx = 0usize;
-        for s in visible_sessions.iter().copied() {
-            if Some(s.pid) == selected_pid {
-                selected_row_idx = Some(row_idx);
-            }
-            let session_rows = render_rows_for_session(s, app);
-            row_idx += session_rows.len();
-            rows.extend(session_rows);
-        }
-        rows
-    };
+    }
 
     let widths = [
         Constraint::Length(7),  // PID
@@ -304,7 +293,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(t.footer),
         ),
         Span::styled(
-            format!("[{selected}/{count}]"),
+            // Position over all navigable roster rows (headers + agents).
+            format!("[{selected}/{}]", roster.len()),
             Style::default().fg(t.footer),
         ),
     ];
@@ -417,7 +407,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         )
         .highlight_symbol("\u{25b6} "); // ▶
 
-    let mut render_state = app.table_state.clone();
+    // ratatui 0.30 made TableState `Copy`, so copy it out rather than clone.
+    let mut render_state = app.table_state;
     render_state.select(selected_row_idx);
     frame.render_stateful_widget(table, chunks[0], &mut render_state);
 

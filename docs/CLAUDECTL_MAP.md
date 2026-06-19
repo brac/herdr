@@ -146,3 +146,50 @@ each session by **canonical `cwd` path** match, with an `(other)` bucket for out
 → Unblocks **Phase 2 (launch)**: `tmux new-window -c {project.path}` + `claude`, via the inherited
 `launch.rs` / `terminals::launch_session`.
 No new dependencies required; this is a pure data-model + render refactor on the inherited layer.
+
+## Toolchain bump — ratatui 0.29 → 0.30 (crossterm 0.28 → 0.29) — DONE
+
+Bumped ahead of Phase 2 to unblock eventually adopting `tui-overlay` (it needs the 0.30
+`ratatui-core`/`ratatui-widgets` split; see the deferred-adoption note). The migration was nearly free:
+**one** source change — ratatui 0.30 made `TableState: Copy`, so `table.rs` copies it out instead of
+`.clone()` (clippy `clone_on_copy`). `Alignment` (now aliased to `HorizontalAlignment`) and
+`highlight_symbol` still accept our usage unchanged.
+
+- **Green:** clean debug+release builds, clippy `-D warnings` clean, **125 tests** (114 core + 11 tui).
+  The 114 vs Phase 1's 121 is platform-gated `#[cfg(target_os = "macos")]` tests excluded under Linux,
+  not a regression. Release binary **1.4 MB** (was 1.3). The `palette`/`csscolorparser`/`pest` color
+  crates appear in `Cargo.lock` but are **locked-not-compiled** (ratatui 0.30 keeps `palette` off by
+  default), so there was nothing to feature-trim.
+- **Build note:** herdr only compiles under **WSL/Linux**, never native Windows MSVC — the inherited
+  layer has unconditional Unix syscalls (`libc::getuid`/`kill`/`getppid`). Mac + WSL is the target.
+
+## Phase 2 — launch into the selected project (CLAUDE.md §2, §7) — DONE
+
+The launch plumbing was already inherited (`n` → `LaunchForm` → `launch::launch` →
+`terminals::launch_session` → `tmux::launch` runs `tmux new-window -c {cwd} "claude …"`). The Phase 2
+work was the missing **project-first selection** so you can launch into a project — including an idle,
+zero-agent repo (the headline case):
+
+- **`RosterRow` + `App::roster_layout()`** (`app.rs`): the new single source of truth for row order
+  *and* selection — a `Header` per project group followed by its agents (grouped view) or just the
+  visible agents (flat view). `table_state` now selects a **roster ordinal**, not a session ordinal,
+  so project headers are navigable. `ui::table::render` consumes `roster_layout` directly (no more
+  `selected_pid` → row matching), keeping order and selection in lockstep.
+- **`selected_session()`** returns `None` on a header row (kill/switch/detail degrade gracefully);
+  **`selected_launch_cwd()`** resolves the project path for a header, the owning project for an agent,
+  or the agent's own cwd for an out-of-tree session. `next`/`previous`/`normalize_selection`/refresh
+  seed all moved from `visible_session_count` → `roster_len`.
+- **`enter_launch_mode()`** pre-fills `launch_form.cwd` from `selected_launch_cwd()`, so `n` launches
+  into wherever the cursor sits; falls back to the CLI default `.` when nothing is selected.
+
+- **Gate met:** from `~/Work`, all 11 sibling repos render as **navigable, launchable roster rows**
+  (proven TTY-free by the extended `examples/projects`). clippy `-D warnings` clean; **130 tests**
+  (114 core + 16 tui, +5 new for roster ordering, header-vs-agent selection, launch-cwd targeting,
+  idle-project navigation, and the cwd prefill); no new dependencies.
+- **Verified vs manual:** logic (unit tests) and the data/roster layer (live example) are verified.
+  The true end-to-end "press `n`, watch an agent spawn" needs an interactive TUI inside a live `tmux`
+  session — a manual step. Under WSL, herdr reads the **Linux** `~/.claude`, so agents must be started
+  with `claude` *inside* WSL/tmux to appear.
+- **Deferred (not gate):** a `tui-overlay`-style drawer for the launch modal (the inherited inline
+  form stands in); prompt/resume UX polish; immediate post-launch refresh (the 2s poll picks up the
+  new agent, per the §3 spawn-and-forget model).

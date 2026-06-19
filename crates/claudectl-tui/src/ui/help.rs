@@ -75,7 +75,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("  n              ", Style::default().fg(t.highlight_key)),
             Span::raw(
-                "  Launch wizard for cwd, prompt, and resume (GNOME Terminal/tmux/Kitty/WezTerm/Windows Terminal on WSL)",
+                "  Launch an agent into the selected project (tmux split pane). N = wizard (prompt/resume)",
             ),
         ]),
         Line::from(vec![

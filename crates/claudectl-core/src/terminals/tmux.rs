@@ -9,13 +9,27 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     );
     let command = parts.join(" ");
 
+    // Split herdr's pane (bottom half) so the agent opens as the *real* terminal
+    // beside the overview — native rendering, talk to it directly — rather than
+    // taking over a separate window. Target herdr's own pane via $TMUX_PANE so
+    // the split lands here even if another pane is active. tmux owns the layout
+    // from here (zoom with `prefix z`, rearrange as you like).
+    let mut args: Vec<String> = vec!["split-window".into(), "-v".into()];
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        args.push("-t".into());
+        args.push(pane);
+    }
+    args.push("-c".into());
+    args.push(cwd.to_string());
+    args.push(command);
+
     let output = std::process::Command::new("tmux")
-        .args(["new-window", "-c", cwd, &command])
+        .args(&args)
         .output()
-        .map_err(|e| format!("tmux new-window failed: {e}"))?;
+        .map_err(|e| format!("tmux split-window failed: {e}"))?;
 
     if output.status.success() {
-        Ok("tmux window".into())
+        Ok("tmux split pane".into())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }

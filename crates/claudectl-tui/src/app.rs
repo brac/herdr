@@ -2857,6 +2857,11 @@ impl App {
             (KeyCode::Char('n'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
+                self.quick_launch();
+            }
+            (KeyCode::Char('N'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
                 self.enter_launch_mode();
             }
             (KeyCode::Char('P'), _) => {
@@ -2946,6 +2951,23 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Instant launch (no wizard): start an agent in the selected project with
+    /// no prompt/resume. `n` uses this; `N` opens the full wizard. The agent
+    /// opens in a tmux split pane (see `tmux::launch`).
+    fn quick_launch(&mut self) {
+        let cwd = self
+            .selected_launch_cwd()
+            .unwrap_or_else(|| self.parent_dir.clone());
+        let cwd = cwd.to_string_lossy().into_owned();
+        let result = launch::prepare(&cwd, None, None).and_then(|req| {
+            launch::launch(&req).map(|target| (target, req.cwd_path.display().to_string()))
+        });
+        self.status_msg = match result {
+            Ok((target, path)) => format!("Launched agent in {target} at {path}"),
+            Err(err) => format!("Launch failed: {err}"),
+        };
     }
 
     fn enter_launch_mode(&mut self) {

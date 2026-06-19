@@ -72,8 +72,13 @@ Do this refactor (Phase 1) before any new panel work.
 
 ## 3. Architecture invariants (do not violate without explicit signoff)
 
-- **No async runtime.** Poll loop: `crossterm::event::poll` with timeout → synchronous data refresh
-  → render. Local filesystem reads are <1ms; async buys nothing and costs 2–3MB + complexity.
+- **No async runtime (no tokio).** The render loop stays synchronous, but data refresh is
+  **event-driven via OS threads**, not fixed polling: a `notify` (fsnotify) watcher thread pushes
+  change events over an `mpsc` channel the loop drains, so an agent's activity updates the roster
+  near-instantly. `crossterm::event::poll` with a short timeout doubles as a slow safety-net tick
+  (and drives the git-status throttle, which is *not* file-watched). Threads + channels only — never
+  `async`/`await` or a tokio runtime; that buys nothing here and costs 2–3MB + complexity. The one
+  new dep (`notify`) is justified by removing the up-to-2s polling lag. See the event-loop plan.
 - **Slow/network work is spawn-and-forget.** `git push`/`pull` and agent launches use
   `Command::spawn()` (stdin/stdout/stderr null), never block the render loop. The *next* poll picks
   up the new state. This is claudectl's existing hook pattern — reuse it.
@@ -149,10 +154,20 @@ monospace hierarchy, keybinding conventions, the four non-negotiables above).
   off projects. Gate: roster shows projects, each listing its live agents.
 - **Phase 2 — Launch.** Launch an agent into a project from an action drawer: `tmux new-window -c
   {cwd}` + send-keys `claude`. Gate: can start an agent without leaving the cockpit.
+- **Phase 2.5 — Event-driven refresh.** Replace fixed polling with a `notify` watcher thread →
+  `mpsc` channel drained by the render loop; poll timeout becomes a slow safety-net tick (§3).
+  Gate: an agent's JSONL activity refreshes the roster without waiting for the next poll. See
+  `EVENT_LOOP_PLAN.md`.
 - **Phase 3 — Git light path.** Porcelain status per project; spawn-and-forget push/pull; skeleton
-  while network resolves. Gate: branch/dirty/ahead-behind visible; push/pull non-blocking.
-- **Phase 4 — Conversation.** Extend JSONL parser to keep message content; oatmeal-style bubbles.
-  Gate: can read an agent's exchange in-cockpit. (This is what turns monitor → cockpit feel.)
+  while network resolves. Gate: branch/dirty/ahead-behind visible; push/pull non-blocking. See
+  `PHASE3_PLAN.md`.
+- **Phase 4 — Conversation + control (interactive).** Extend the JSONL parser to keep message
+  content; oatmeal-style bubbles (assistant left / me right). Then add **control**: a `tui-textarea`
+  input that sends prompts into the agent's existing tmux pane, plus one-key approve/deny/interrupt —
+  all via the inherited `terminals::send_input`/`approve_session` backends (tmux still owns the
+  process; we are a remote control, not a lifecycle owner — §0). Gate: read an agent's exchange
+  *and* drive it (send a prompt, approve a permission prompt) without leaving the cockpit. See
+  `PHASE4_PLAN.md`.
 - **Phase 5 — Graphs.** Add ratatui sparklines/gauges for the numbers that earned a permanent spot.
   Gate: graphs reflect real data and we actually glance at them.
 

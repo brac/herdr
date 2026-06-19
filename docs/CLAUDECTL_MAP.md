@@ -193,3 +193,39 @@ zero-agent repo (the headline case):
 - **Deferred (not gate):** a `tui-overlay`-style drawer for the launch modal (the inherited inline
   form stands in); prompt/resume UX polish; immediate post-launch refresh (the 2s poll picks up the
   new agent, per the §3 spawn-and-forget model).
+
+## Discovery fix — cwd→slug now matches Claude Code exactly — DONE
+
+Comparing against `agent-deck` surfaced a live bug in the inherited `discovery.rs::cwd_to_slug`: it
+replaced only `/`, but Claude Code replaces **every non-ASCII-alphanumeric char** with `-` (verified
+against real `~/.claude/projects/` dirs — `burnRat` keeps its capital R; the space in `Ben Bracamonte`
+→ `-`). On any path with a space or `.`, herdr silently failed to match its transcript dir — true on
+this dev machine. Fixed to preserve `[A-Za-z0-9]` and hyphenate the rest; +3 regression tests
+(spaces, dots/underscores, case). This was a prerequisite for Phase 3: per-project git status is
+pointless if agent discovery under those projects is broken.
+
+## Phase 2.5 — event-driven refresh (CLAUDE.md §3, EVENT_LOOP_PLAN.md) — DONE
+
+Polling lag is gone: a `notify` (fsnotify) watcher on its own thread feeds an `mpsc` channel that the
+render loop drains, so an agent's JSONL write repaints the roster near-instantly instead of waiting up
+to 2s. **Threads + channels only — no tokio, no async** (§3 amended to sanction this model).
+
+- **`src/watcher.rs`** (new): `spawn(claude_projects, parent_dir) -> Option<(Receiver<()>, Watcher)>`.
+  Watches `~/.claude/projects` **recursively** (every `<slug>/*.jsonl`) and the project `parent_dir`
+  **non-recursively** (new/removed project dirs, without drowning in editors' file churn inside repos).
+  Forwards only Create/Modify/Remove (drops Access/Other noise); init failure → `None` (degrade to
+  polling, never crash). The `Watcher` guard is held for the loop's life.
+- **`src/main.rs`** event loop: `event::poll(CHANNEL_POLL=200ms)` is the channel's poll granularity
+  (crossterm can't select on an mpsc channel); keys still return instantly. Each iteration drains the
+  channel into one coalesced `fs_dirty` flag → `app.tick()` on an fs event **or** the `TICK_RATE=2s`
+  safety-net tick (which still drives `ps` enrichment, elapsed clocks, and the Phase 3 git throttle).
+  Added a `needs_redraw` gate so the faster loop only repaints on change.
+- **WSL caveat:** inotify is reliable on the **Linux** fs (`~/.claude` → `/home/...`), so agent
+  activity is event-driven. inotify on the `/mnt/c` mount is unreliable, so a project **added/removed**
+  under a `/mnt/c` parent is caught by the 2s safety-net tick instead — graceful, by design.
+- **Gate met / green:** `notify` 8.2.0; release binary **1.53 MB** (was ~1.4; +~0.13 MB, within the
+  agreed budget). **136 tests** (117 core + 16 tui + 2 watcher unit + 1 watcher e2e that writes a real
+  file under a tempdir and asserts an event arrives — proves inotify delivers on this platform); clippy
+  `-D warnings` clean. The true "watch an agent type and see the roster move" is a manual step needing a
+  live agent in WSL/tmux.
+- **Unblocks Phase 3:** git status rides the safety-net tick (not file-watched); see `PHASE3_PLAN.md`.

@@ -46,7 +46,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  d/x            ", Style::default().fg(t.highlight_key)),
-            Span::raw("  Kill session (double-tap to confirm)"),
+            Span::raw("  Kill the agent (d,d = SIGTERM; if it ignores it, d,d again = SIGKILL)"),
         ]),
         Line::from(vec![
             Span::styled("  s              ", Style::default().fg(t.highlight_key)),

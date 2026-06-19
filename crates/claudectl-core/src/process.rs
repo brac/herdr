@@ -129,22 +129,50 @@ fn looks_like_uuid(s: &str) -> bool {
 /// permission). herdr drives this for the `d` (kill) action — the dormant
 /// `MockRuntime::terminate_session` is a no-op, so the real kill lives here.
 pub fn terminate(pid: u32) -> Result<(), String> {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    signal(pid, libc::SIGTERM)
+}
+
+/// Force-kill a process with SIGKILL (uncatchable) — the escalation when a
+/// graceful SIGTERM was ignored.
+pub fn force_kill(pid: u32) -> Result<(), String> {
+    signal(pid, libc::SIGKILL)
+}
+
+fn signal(pid: u32, sig: libc::c_int) -> Result<(), String> {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
     if ret == 0 {
         Ok(())
     } else {
-        Err(format!(
-            "kill {pid}: {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(format!("kill {pid}: {}", std::io::Error::last_os_error()))
     }
 }
 
 #[cfg(test)]
 mod terminate_tests {
-    use super::terminate;
+    use super::{force_kill, terminate};
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    fn wait_exit(child: &mut std::process::Child, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn force_kill_ends_a_child() {
+        // SIGKILL is the escalation for an agent that ignored SIGTERM. Prove the
+        // signal is delivered and ends the process.
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let pid = child.id();
+        force_kill(pid).expect("SIGKILL delivered");
+        wait_exit(&mut child, "SIGKILL should end the child");
+    }
 
     #[test]
     fn terminate_kills_a_real_child() {

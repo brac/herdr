@@ -337,6 +337,9 @@ pub struct App {
     pub should_quit: bool,
     pub status_msg: String,
     pub pending_kill: Option<u32>,
+    /// PIDs already sent SIGTERM that are still alive — a repeat kill escalates
+    /// to SIGKILL (CLAUDE.md §3 defensive: never crash if a PID is gone).
+    pub sigterm_sent: HashSet<u32>,
     pub input_mode: bool,
     pub input_buffer: String,
     pub input_target_pid: Option<u32>,
@@ -642,6 +645,7 @@ impl App {
             should_quit: false,
             status_msg: String::new(),
             pending_kill: None,
+            sigterm_sent: HashSet::new(),
             input_mode: false,
             role_bind_mode: false,
             role_bind_buffer: String::new(),
@@ -1193,6 +1197,10 @@ impl App {
 
         // Update prev_statuses
         self.prev_statuses = sessions.iter().map(|s| (s.pid, s.status)).collect();
+
+        // Drop SIGTERM-escalation tracking for PIDs that are gone (kill worked).
+        self.sigterm_sent
+            .retain(|pid| sessions.iter().any(|s| s.pid == *pid));
 
         self.sessions = sessions;
 
@@ -2130,11 +2138,25 @@ impl App {
         let pid = session.pid;
         let name = session.display_name().to_string();
 
+        // Already SIGTERM'd and still here → escalate to SIGKILL. Real signals;
+        // the runtime's terminate_session is the inert mock.
+        let escalate = self.sigterm_sent.contains(&pid);
+
         if self.pending_kill == Some(pid) {
-            // Real SIGTERM — the runtime's terminate_session is the inert mock.
-            match process::terminate(pid) {
+            let result = if escalate {
+                process::force_kill(pid)
+            } else {
+                process::terminate(pid)
+            };
+            match result {
                 Ok(()) => {
-                    self.status_msg = format!("Killed {name} (PID {pid})");
+                    if escalate {
+                        self.status_msg = format!("Force-killed {name} (PID {pid}) [SIGKILL]");
+                        self.sigterm_sent.remove(&pid);
+                    } else {
+                        self.status_msg = format!("Sent SIGTERM to {name} (PID {pid})");
+                        self.sigterm_sent.insert(pid);
+                    }
                     self.auto_approve.remove(&pid);
                     // Don't delete session file yet — let the Finished tombstone show for 30s.
                     // The file will be cleaned up when the tombstone expires.
@@ -2145,7 +2167,11 @@ impl App {
             self.pending_kill = None;
         } else {
             self.pending_kill = Some(pid);
-            self.status_msg = format!("Kill {name} (PID {pid})? Press d again to confirm");
+            self.status_msg = if escalate {
+                format!("{name} (PID {pid}) ignored SIGTERM — press d again to SIGKILL")
+            } else {
+                format!("Kill {name} (PID {pid})? Press d again to confirm")
+            };
         }
     }
 

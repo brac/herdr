@@ -817,12 +817,21 @@ impl App {
             session.prev_cost_usd = session.cost_usd;
         }
 
-        // Read JSONL incrementally (only new bytes since last offset)
+        // Read JSONL incrementally (only new bytes since last offset). A session
+        // whose offset advanced had real transcript activity this refresh — its
+        // working tree likely changed, so re-fetch that project's git status
+        // (event-driven; in-flight dedup keeps streaming from spamming `git`).
         let jsonl_start = std::time::Instant::now();
+        let mut active_cwds: Vec<String> = Vec::new();
         for session in &mut sessions {
+            let before = session.jsonl_offset;
             monitor::update_tokens(session);
+            if session.jsonl_offset != before {
+                active_cwds.push(session.cwd.clone());
+            }
         }
         let jsonl_elapsed = jsonl_start.elapsed();
+        self.enqueue_git_for_cwds(&active_cwds);
 
         // Compute burn rate from cost delta (skip first tick where prev_cost is 0)
         for session in &mut sessions {
@@ -1246,6 +1255,32 @@ impl App {
     /// navigation — "passing over a row polls it"). No-op when nothing's selected.
     fn enqueue_selected_git(&mut self) {
         if let Some(path) = self.selected_launch_cwd() {
+            self.enqueue_git(&path);
+        }
+    }
+
+    /// Re-fetch git status for each project that owns one of `cwds` (agent
+    /// transcript activity → working tree likely changed). Event-driven; the
+    /// `git_inflight` dedup means a streaming agent triggers at most one git
+    /// status at a time for its project, never a pile-up.
+    fn enqueue_git_for_cwds(&mut self, cwds: &[String]) {
+        if cwds.is_empty() {
+            return;
+        }
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut targets: Vec<PathBuf> = Vec::new();
+        for cwd in cwds {
+            let cwd_c = canon(Path::new(cwd));
+            for proj in &self.projects {
+                if proj.has_git && projects::contains_cwd(&canon(&proj.path), &cwd_c) {
+                    if !targets.contains(&proj.path) {
+                        targets.push(proj.path.clone());
+                    }
+                    break; // first owning project wins
+                }
+            }
+        }
+        for path in targets {
             self.enqueue_git(&path);
         }
     }
@@ -3931,6 +3966,31 @@ mod tests {
         assert!(
             app.git_inflight.contains(&path),
             "landing on a row should re-fetch its git status"
+        );
+    }
+
+    #[test]
+    fn agent_activity_re_fetches_its_project_git() {
+        // A session whose JSONL advanced (mapped via cwd) re-fetches its project,
+        // even when already cached — event-driven, no timer.
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        let path = PathBuf::from("/tmp/proj");
+        app.projects = vec![Project {
+            path: path.clone(),
+            name: "proj".into(),
+            has_git: true,
+        }];
+        app.git_inflight.clear();
+        app.git_cache.clear();
+        app.git_cache.insert(path.clone(), Some(GitStatus::default()));
+
+        // An agent working in a subdir of the project had activity.
+        app.enqueue_git_for_cwds(&["/tmp/proj/src".to_string()]);
+
+        assert!(
+            app.git_inflight.contains(&path),
+            "agent activity in a project should re-fetch its git status"
         );
     }
 

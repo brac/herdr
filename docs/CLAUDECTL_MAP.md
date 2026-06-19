@@ -302,3 +302,13 @@ above. 156 tests; clippy clean.
 
 Note: an agent actively editing files in a **non-selected** repo won't update its
 dirty flag until you land on it or press `r` — an accepted trade for zero idle churn.
+
+### Addendum — agent-activity trigger
+
+Added a 5th event trigger: in `refresh()`, a session whose `jsonl_offset` advanced
+(real transcript activity) maps via its cwd to its owning project, which is
+re-fetched (`enqueue_git_for_cwds`). So an agent editing files in a **non-selected**
+repo now updates that repo's dirty flag live — closing the earlier trade-off.
+Still event-driven (driven by transcript writes, not a timer); `git_inflight` dedup
+means a streaming agent triggers at most one `git status` at a time for its project.
+Guard: `agent_activity_re_fetches_its_project_git`. 157 tests.

@@ -477,6 +477,9 @@ pub struct App {
     /// Phase 4b reply box: the prompt being composed in the chat overlay. The
     /// box is always focused for typing — arrows/PgUp/PgDn scroll, Esc closes.
     pub chat_input: String,
+    /// Whether this terminal can inject keystrokes into agent panes (computed
+    /// once at startup). False outside tmux/Kitty on WSL → chat is read-only.
+    pub input_supported: bool,
     /// Which tab is currently active inside the brain overlay.
     pub brain_tab: BrainTab,
     /// Currently selected index into `brain_queue`.
@@ -742,6 +745,7 @@ impl App {
             chat_pid: None,
             chat_scroll: 0,
             chat_input: String::new(),
+            input_supported: terminals::supports_input(),
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
             brain_queue: Vec::new(),
@@ -2392,6 +2396,11 @@ impl App {
     fn send_chat_input(&mut self) {
         let text = self.chat_input.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if !self.input_supported {
+            self.status_msg =
+                "Input needs tmux — run agents and herdr inside tmux (see ? help)".into();
             return;
         }
         let Some(pid) = self.chat_pid else {
@@ -4119,6 +4128,7 @@ mod tests {
         let mut app = App::new();
         app.sessions = Vec::new();
         app.show_chat = true;
+        app.input_supported = true; // exercise the missing-agent guard, not the tmux gate
         app.chat_pid = Some(999); // no such session
         for c in ['h', 'i'] {
             app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -4135,11 +4145,23 @@ mod tests {
         let mut s = make_session(7, "remote-proj", "opus", SessionStatus::Processing, 0.0, 0.0, true);
         s.worker_origin = Some("worker-1".into());
         app.sessions = vec![s];
+        app.input_supported = true; // exercise the remote guard, not the tmux gate
         app.chat_pid = Some(7);
         app.chat_input = "do a thing".into();
         app.send_chat_input();
         assert!(app.status_msg.contains("Remote session"));
         assert_eq!(app.chat_input, "do a thing", "remote send must not clear the draft");
+    }
+
+    #[test]
+    fn send_chat_input_without_tmux_gives_a_clear_hint() {
+        let mut app = App::new();
+        app.input_supported = false; // e.g. plain WSL terminal, no tmux
+        app.chat_pid = Some(1);
+        app.chat_input = "hello".into();
+        app.send_chat_input();
+        assert!(app.status_msg.contains("tmux"));
+        assert_eq!(app.chat_input, "hello", "blocked send must not clear the draft");
     }
 
     #[test]

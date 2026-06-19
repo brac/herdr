@@ -22,11 +22,18 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|pid| app.sessions.iter().find(|s| s.pid == pid));
 
     let title = match session {
-        Some(s) => format!(
-            " chat · {} (PID {})  —  type · Enter send · ↑↓ scroll · Esc close ",
-            s.display_name(),
-            s.pid
-        ),
+        Some(s) => {
+            let mode = if app.input_supported {
+                "type · Enter send"
+            } else {
+                "read-only (needs tmux)"
+            };
+            format!(
+                " chat · {} (PID {})  —  {mode} · ↑↓ scroll · Esc close ",
+                s.display_name(),
+                s.pid
+            )
+        }
         None => " chat ".to_string(),
     };
     let block = Block::default()
@@ -122,12 +129,21 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
         );
     }
 
-    // Reply box (Phase 4b): always focused — type a prompt, Enter sends.
-    let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(t.input_accent)),
-        Span::raw(app.chat_input.as_str()),
-        Span::styled("▏", Style::default().fg(t.input_accent)),
-    ]);
+    // Reply box (Phase 4b): always focused — type a prompt, Enter sends. When
+    // this terminal can't inject keystrokes (no tmux), say so up front instead of
+    // pretending the box is live: reading works, sending doesn't.
+    let input_line = if app.input_supported {
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(t.input_accent)),
+            Span::raw(app.chat_input.as_str()),
+            Span::styled("▏", Style::default().fg(t.input_accent)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  ⚠ read-only — input needs tmux (run agents and herdr inside tmux)",
+            Style::default().fg(t.error),
+        ))
+    };
     frame.render_widget(Paragraph::new(input_line), input_area);
 }
 

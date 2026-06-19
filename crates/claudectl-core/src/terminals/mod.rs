@@ -1066,6 +1066,22 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
     }
 }
 
+/// Whether the detected terminal can inject keystrokes into a session's pane
+/// (send a prompt, approve). Mirrors `send_input`'s dispatch: tmux / GNOME
+/// Terminal / Kitty work everywhere; on macOS the rest fall back to System
+/// Events; Windows Terminal and unknown terminals on Linux/WSL have no injection
+/// path and need tmux (or Kitty) instead.
+pub fn supports_input() -> bool {
+    match detect_terminal() {
+        Terminal::Tmux | Terminal::Gnome | Terminal::Kitty => true,
+        Terminal::WindowsTerm => false,
+        #[cfg(target_os = "macos")]
+        _ => true,
+        #[cfg(not(target_os = "macos"))]
+        _ => false,
+    }
+}
+
 pub fn approve_session(session: &ClaudeSession) -> Result<(), String> {
     match detect_terminal() {
         Terminal::Gnome => gnome_terminal::approve(session),

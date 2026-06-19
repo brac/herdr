@@ -44,15 +44,22 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    // Reserve the bottom row for the reply box; the conversation fills the rest.
-    let input_h = 1;
+    // Reserve the bottom two rows for a status line and the reply box; the
+    // conversation fills the rest. The status line surfaces send results/errors
+    // (otherwise invisible, since the chat overlay hides the roster status bar).
+    let footer_h = 2u16.min(inner.height);
     let convo = Rect {
-        height: inner.height.saturating_sub(input_h),
+        height: inner.height.saturating_sub(footer_h),
+        ..inner
+    };
+    let status_area = Rect {
+        y: inner.y + convo.height,
+        height: footer_h.saturating_sub(1),
         ..inner
     };
     let input_area = Rect {
-        y: inner.y + convo.height,
-        height: input_h.min(inner.height),
+        y: inner.y + convo.height + status_area.height,
+        height: footer_h.min(1),
         ..inner
     };
 
@@ -99,6 +106,21 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     let offset = max_off.saturating_sub(scroll);
 
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), convo);
+
+    // Status line: surface the latest send result/error so failures aren't
+    // silent. Tint red when it reads like a failure.
+    if status_area.height > 0 && !app.status_msg.is_empty() {
+        let s = &app.status_msg;
+        let color = if s.contains("fail") || s.contains("Failed") || s.contains("not ") {
+            t.error
+        } else {
+            t.text_muted
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!("  {s}"), Style::default().fg(color)))),
+            status_area,
+        );
+    }
 
     // Reply box (Phase 4b): always focused — type a prompt, Enter sends.
     let input_line = Line::from(vec![

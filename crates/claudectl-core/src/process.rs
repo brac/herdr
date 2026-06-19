@@ -123,3 +123,51 @@ fn looks_like_uuid(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
         && s.matches('-').count() == 4
 }
+
+/// Terminate a process by PID with SIGTERM (graceful). Returns Ok if the signal
+/// was delivered, Err with the OS error otherwise (e.g. no such process, or no
+/// permission). herdr drives this for the `d` (kill) action — the dormant
+/// `MockRuntime::terminate_session` is a no-op, so the real kill lives here.
+pub fn terminate(pid: u32) -> Result<(), String> {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod terminate_tests {
+    use super::terminate;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminate_kills_a_real_child() {
+        // Spawn a long sleep, SIGTERM it, and confirm it exits.
+        let mut child = Command::new("sleep").arg("60").spawn().expect("spawn sleep");
+        let pid = child.id();
+        terminate(pid).expect("SIGTERM should be delivered");
+
+        // Poll try_wait until the child is reaped (SIGTERM ends `sleep`).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child should have exited after SIGTERM");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn terminate_missing_pid_errors() {
+        // PID 0 is the caller's process group — SIGTERM to a clearly-invalid high
+        // PID should fail with ESRCH rather than signal anything.
+        assert!(terminate(2_000_000_000).is_err());
+    }
+}

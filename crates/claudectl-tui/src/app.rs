@@ -2131,7 +2131,8 @@ impl App {
         let name = session.display_name().to_string();
 
         if self.pending_kill == Some(pid) {
-            match self.runtime.actions.terminate_session(pid) {
+            // Real SIGTERM — the runtime's terminate_session is the inert mock.
+            match process::terminate(pid) {
                 Ok(()) => {
                     self.status_msg = format!("Killed {name} (PID {pid})");
                     self.auto_approve.remove(&pid);

@@ -259,3 +259,23 @@ to the `git` binary, parse stdout — no `git2`/libgit2, no diff/staging/rebase 
   release binary **1.55 MB**; **no new dependencies** (the git path is pure shell-out).
 - **Deferred (not gate):** confirm-on-push modal; a `tui-overlay` drawer; richer git detail (it's a
   glance by design — full git is "open a tmux pane running gitui", §4).
+
+## Phase 3 follow-up — git status moved off the render thread (perf fix)
+
+Shipping 3b synchronously was a mistake on the WSL `/mnt/c` mount: `git status`
+there costs 150ms–830ms+ per repo (vs ~5ms on a native SSD), so the 10s-TTL
+batch recompute of all ~12 repos froze the UI for several seconds on each expiry
+— "smooth, then a multi-second freeze, repeat." This violated §3 (slow work must
+not block the render loop); the plan's "git is a cheap local read" held for
+native fs, not drvfs.
+
+Fix: a `GitStatusService` worker thread computes `git::status` off the render
+thread; `refresh_git_cache` now only drains results from a channel and enqueues
+stale paths (O(channel ops), never blocks). Spawn-and-forget, same pattern as
+push/pull and the watcher — threads, no tokio (§3). Status trickles in over a
+couple seconds in the background while the UI stays responsive.
+
+Gap that let it through: tests ran `git` on one `/tmp` repo (fast); the example
+did a single non-looping refresh, so the periodic freeze never surfaced.
+Regression guard added: `git_status_is_fetched_off_thread_not_inline` asserts
+`refresh_git_cache` enqueues rather than populating the cache inline. 154 tests.

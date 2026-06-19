@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -288,6 +289,34 @@ pub struct GitOp {
     started: Instant,
 }
 
+/// Background git-status worker (CLAUDE.md §3/§4). `git status` on the WSL
+/// `/mnt/c` mount costs 100ms–1s+ per repo; computing it for every project on
+/// the render thread froze the UI on each cache-TTL expiry. So status is fetched
+/// on a worker thread and the cache is updated from results — spawn-and-forget,
+/// the render loop never blocks on `git`. One worker processes requests serially
+/// in the background; the UI stays responsive while statuses trickle in.
+struct GitStatusService {
+    req_tx: Sender<PathBuf>,
+    res_rx: Receiver<(PathBuf, Option<GitStatus>)>,
+}
+
+impl GitStatusService {
+    fn spawn() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(PathBuf, Option<GitStatus>)>();
+        std::thread::spawn(move || {
+            // Exits when `req_rx` closes (App dropped → req_tx gone).
+            while let Ok(path) = req_rx.recv() {
+                let status = git::status(&path);
+                if res_tx.send((path, status)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { req_tx, res_rx }
+    }
+}
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -300,6 +329,11 @@ pub struct App {
     /// Per-project git status (Phase 3), keyed by project path with the instant
     /// it was computed. Throttled by `GIT_STATUS_TTL`; see `refresh_git_cache`.
     pub git_cache: HashMap<PathBuf, (Instant, GitStatus)>,
+    /// Background worker that computes `git status` off the render thread (§3).
+    git_svc: GitStatusService,
+    /// Projects whose status request is in flight on the worker — avoids
+    /// re-enqueuing the same path every refresh while it's being computed.
+    git_inflight: HashSet<PathBuf>,
     /// In-flight fire-and-forget push/pull per project (Phase 3c). Polled each
     /// refresh via `try_wait`; drives the throbber while present.
     pub git_ops: HashMap<PathBuf, GitOp>,
@@ -593,6 +627,8 @@ impl App {
             projects: Vec::new(),
             include_non_git: false,
             git_cache: HashMap::new(),
+            git_svc: GitStatusService::spawn(),
+            git_inflight: HashSet::new(),
             git_ops: HashMap::new(),
             table_state: TableState::default(),
             should_quit: false,
@@ -1160,16 +1196,15 @@ impl App {
         }
     }
 
-    /// Refresh the per-project git-status cache (Phase 3 light path). Recompute a
-    /// project's status only when its entry is missing or older than
-    /// `GIT_STATUS_TTL`, prune entries for projects that vanished, and skip
-    /// non-git dirs. A `git::status` that returns `None` (git missing, transient
-    /// error) drops the entry so the roster shows no segment rather than stale
-    /// data. Cheap and throttled — fine to call every `refresh()` (§3).
+    /// Refresh the per-project git-status cache (Phase 3 light path) **without
+    /// blocking the render thread** (§3). Each call: drain any results the
+    /// background worker has produced into the cache, prune vanished projects,
+    /// then enqueue stale (missing or older than `GIT_STATUS_TTL`) non-in-flight
+    /// projects for the worker to compute. `git status` itself runs on the
+    /// worker — see `GitStatusService` — so this stays O(channel ops), even when
+    /// every repo is on the slow `/mnt/c` mount. Cheap; fine to call every tick.
     fn refresh_git_cache(&mut self) {
         let now = Instant::now();
-        // Live git-project paths this scan. Owned so we don't hold a borrow on
-        // `self.projects` while mutating `self.git_cache`.
         let live: HashSet<PathBuf> = self
             .projects
             .iter()
@@ -1177,23 +1212,35 @@ impl App {
             .map(|p| p.path.clone())
             .collect();
 
-        self.git_cache.retain(|path, _| live.contains(path));
+        // Drain completed background results into the cache.
+        while let Ok((path, status)) = self.git_svc.res_rx.try_recv() {
+            self.git_inflight.remove(&path);
+            match status {
+                Some(st) => {
+                    self.git_cache.insert(path, (now, st));
+                }
+                None => {
+                    self.git_cache.remove(&path);
+                }
+            }
+        }
 
+        // Drop state for projects that vanished.
+        self.git_cache.retain(|path, _| live.contains(path));
+        self.git_inflight.retain(|path| live.contains(path));
+
+        // Enqueue stale, not-already-in-flight projects for background compute.
         for path in &live {
+            if self.git_inflight.contains(path) {
+                continue;
+            }
             let stale = self
                 .git_cache
                 .get(path)
                 .map(|(t, _)| now.duration_since(*t) >= GIT_STATUS_TTL)
                 .unwrap_or(true);
-            if stale {
-                match git::status(path) {
-                    Some(st) => {
-                        self.git_cache.insert(path.clone(), (now, st));
-                    }
-                    None => {
-                        self.git_cache.remove(path);
-                    }
-                }
+            if stale && self.git_svc.req_tx.send(path.clone()).is_ok() {
+                self.git_inflight.insert(path.clone());
             }
         }
     }
@@ -3783,6 +3830,42 @@ mod tests {
         assert_eq!(git.branch, "main");
         assert!(git.dirty);
         assert_eq!(git.ahead, 2);
+    }
+
+    #[test]
+    fn git_status_is_fetched_off_thread_not_inline() {
+        // Regression guard (the ~10s /mnt/c freeze): refresh_git_cache must
+        // ENQUEUE stale projects for the background worker, never compute
+        // `git status` inline on the render thread. So immediately after a
+        // refresh, nothing is in the cache yet — the paths are in flight.
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        app.git_cache.clear();
+        app.git_inflight.clear();
+        app.projects = vec![
+            Project {
+                path: PathBuf::from("/nonexistent/repo-a"),
+                name: "a".into(),
+                has_git: true,
+            },
+            Project {
+                path: PathBuf::from("/nonexistent/repo-b"),
+                name: "b".into(),
+                has_git: true,
+            },
+        ];
+
+        app.refresh_git_cache();
+
+        assert!(
+            app.git_cache.is_empty(),
+            "status must not be computed inline — that blocks the render thread"
+        );
+        assert_eq!(
+            app.git_inflight.len(),
+            2,
+            "both stale projects should be queued on the background worker"
+        );
     }
 
     #[test]

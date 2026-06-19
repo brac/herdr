@@ -15,6 +15,7 @@
 
 pub mod config;
 pub mod discovery;
+pub mod git;
 pub mod health;
 pub mod helpers;
 pub mod history;

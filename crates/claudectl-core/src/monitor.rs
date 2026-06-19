@@ -4,7 +4,9 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use serde_json::Value;
 
 use crate::models;
-use crate::session::{ClaudeSession, SessionStatus, SubagentRollup, TelemetryStatus};
+use crate::session::{
+    ChatKind, ChatRole, ClaudeSession, SessionStatus, SubagentRollup, TelemetryStatus,
+};
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
 
 #[derive(Default)]
@@ -153,7 +155,31 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                                     session.model = shorten_model(&model);
                                 }
 
+                                // Phase 4: retain content for the conversation view.
+                                let chat_role = match message.role {
+                                    TranscriptRole::Assistant => ChatRole::Assistant,
+                                    TranscriptRole::User => ChatRole::User,
+                                };
+
                                 for block in message.content {
+                                    match &block {
+                                        TranscriptBlock::Text(text) => {
+                                            session.push_chat(
+                                                chat_role,
+                                                ChatKind::Text,
+                                                text.clone(),
+                                            );
+                                        }
+                                        TranscriptBlock::ToolUse { name, input } => {
+                                            session.push_chat(
+                                                ChatRole::Assistant,
+                                                ChatKind::Tool,
+                                                summarize_tool(name, input),
+                                            );
+                                        }
+                                        // Tool results are noisy; the chat view skips them.
+                                        TranscriptBlock::ToolResult { .. } => {}
+                                    }
                                     match &block {
                                         TranscriptBlock::ToolUse { name, input } => {
                                             record_tool_usage(name, input, session);
@@ -411,6 +437,26 @@ pub fn model_context_max(model: &str) -> u64 {
 }
 
 /// Extract tool usage stats and file paths from tool_use content blocks.
+/// A compact one-line summary of a tool call for the chat view, e.g.
+/// `Edit: src/lib.rs` or `Bash: cargo test`. Falls back to the tool name.
+fn summarize_tool(name: &str, input: &Value) -> String {
+    let detail = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .or_else(|| input.get("command"))
+        .or_else(|| input.get("pattern"))
+        .or_else(|| input.get("query"))
+        .or_else(|| input.get("url"))
+        .and_then(|v| v.as_str());
+    match detail {
+        Some(d) if !d.is_empty() => {
+            let d = d.replace('\n', " ");
+            format!("{name}: {}", crate::session::truncate_str(&d, 60))
+        }
+        _ => name.to_string(),
+    }
+}
+
 fn record_tool_usage(tool_name: &str, input: &Value, session: &mut ClaudeSession) {
     if tool_name.is_empty() {
         return;
@@ -569,4 +615,50 @@ fn estimate_cost_components(
         cost,
         resolved.source == models::ModelProfileSource::Fallback,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{summarize_tool, update_tokens};
+    use crate::session::{ClaudeSession, RawSession};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn update_tokens_retains_conversation_from_transcript() {
+        // End-to-end (Phase 4a): a real transcript line populates the chat buffer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let line = include_str!("../../../tests/fixtures/real-transcript-line.json");
+        std::fs::write(&path, format!("{}\n", line.trim())).unwrap();
+
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "x".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+        });
+        s.jsonl_path = Some(PathBuf::from(&path));
+
+        update_tokens(&mut s);
+
+        assert!(
+            !s.conversation.is_empty(),
+            "conversation should be populated from the transcript"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_uses_key_arg_then_falls_back_to_name() {
+        assert_eq!(
+            summarize_tool("Edit", &json!({"file_path": "src/lib.rs"})),
+            "Edit: src/lib.rs"
+        );
+        assert_eq!(
+            summarize_tool("Bash", &json!({"command": "cargo test"})),
+            "Bash: cargo test"
+        );
+        // No recognised arg → bare tool name.
+        assert_eq!(summarize_tool("TodoWrite", &json!({"todos": []})), "TodoWrite");
+    }
 }

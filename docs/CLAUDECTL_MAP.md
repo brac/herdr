@@ -312,3 +312,25 @@ repo now updates that repo's dirty flag live — closing the earlier trade-off.
 Still event-driven (driven by transcript writes, not a timer); `git_inflight` dedup
 means a streaming agent triggers at most one `git status` at a time for its project.
 Guard: `agent_activity_re_fetches_its_project_git`. 157 tests.
+
+## Phase 4a — conversation view (oatmeal chat, read-only) — DONE
+
+Read an agent's exchange in-cockpit (CLAUDE.md §5, PHASE4_PLAN.md Part A).
+
+- **Retention:** the JSONL parser already extracted content; `monitor::update_tokens`
+  now appends it to `ClaudeSession.conversation` — a bounded ring (`MAX_CONVERSATION`
+  = 300) of `ChatMessage { role, kind, text }`. Assistant/User text → bubbles;
+  tool_use → a compact `summarize_tool` line (e.g. `Edit: src/lib.rs`); tool_result
+  skipped (noisy). New `ChatRole`/`ChatKind`/`ChatMessage` + `push_chat` in `session.rs`.
+- **UI:** `ui/chat.rs::render_chat` — oatmeal layout (assistant left, me right, tools
+  dim left), hand-rolled word-wrap (no `textwrap` dep), themed (NO_COLOR respected),
+  Paragraph scroll pinned to the newest line so a live agent streams in.
+- **Control:** `C` opens the chat for the selected agent (pinned by PID); `j/k`/arrows
+  scroll, `g`/`G` jump to oldest/newest, `Esc`/`C`/`q` close. New overlay state
+  (`show_chat`/`chat_pid`/`chat_scroll`) + `handle_chat_key`; dispatched in `handle_key`
+  alongside skills/brain; drawn in `main.rs`. Documented in the help overlay.
+- **Green:** 163 tests (incl. ring-buffer cap, `summarize_tool`, wrap, and an E2E
+  `update_tokens` retention test against the real fixture); clippy `-D warnings` clean;
+  release **1.61 MB**; **no new dependencies**.
+- **Next:** 4b (input → send_input into the agent's pane) and 4c (approve/deny/interrupt
+  + `capture-pane` prompt preview).

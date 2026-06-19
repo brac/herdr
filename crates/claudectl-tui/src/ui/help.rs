@@ -79,6 +79,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
+            Span::styled("  C              ", Style::default().fg(t.highlight_key)),
+            Span::raw("  Open the selected agent's conversation (oatmeal chat; j/k scroll, Esc close)"),
+        ]),
+        Line::from(vec![
             Span::styled("  P / L          ", Style::default().fg(t.highlight_key)),
             Span::raw("  git push / pull the selected project (fire-and-forget, non-blocking)"),
         ]),

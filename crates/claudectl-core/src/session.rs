@@ -171,6 +171,10 @@ pub struct ClaudeSession {
     /// If set, this session is from a remote worker (not local).
     /// Terminal actions (approve, kill, etc.) are disabled for remote sessions.
     pub worker_origin: Option<String>,
+    /// Recent conversation messages for the chat view (Phase 4), oldest→newest,
+    /// capped at `MAX_CONVERSATION` (a ring buffer). Populated incrementally by
+    /// `monitor::update_tokens` as new transcript lines are parsed.
+    pub conversation: Vec<ChatMessage>,
 }
 
 /// A captured tool error with context.
@@ -178,6 +182,32 @@ pub struct ClaudeSession {
 pub struct ErrorEntry {
     pub tool_name: String,
     pub message: String,
+}
+
+/// Cap on retained conversation messages per session (ring buffer) — bounds
+/// memory on long-running agents while keeping plenty of scrollback.
+pub const MAX_CONVERSATION: usize = 300;
+
+/// Who produced a chat message (oatmeal layout: assistant left, me right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    Assistant,
+    User,
+}
+
+/// What kind of chat line this is — prose text vs. a compact tool-call summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    Text,
+    Tool,
+}
+
+/// One rendered line in the conversation view.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub kind: ChatKind,
+    pub text: String,
 }
 
 /// Per-tool usage statistics.
@@ -350,6 +380,7 @@ impl ClaudeSession {
             last_tool_error: false,
             last_error_message: None,
             recent_errors: Vec::new(),
+            conversation: Vec::new(),
             total_tokens_at_edit_count: 0,
             edit_event_count: 0,
             baseline_tokens_per_edit: None,
@@ -419,6 +450,19 @@ impl ClaudeSession {
             &self.session_name
         } else {
             &self.project_name
+        }
+    }
+
+    /// Append a conversation message (Phase 4), dropping the oldest once the ring
+    /// exceeds `MAX_CONVERSATION`. Empty text is ignored.
+    pub fn push_chat(&mut self, role: ChatRole, kind: ChatKind, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.conversation.push(ChatMessage { role, kind, text });
+        if self.conversation.len() > MAX_CONVERSATION {
+            let excess = self.conversation.len() - MAX_CONVERSATION;
+            self.conversation.drain(0..excess);
         }
     }
 
@@ -863,6 +907,27 @@ mod tests {
             cwd: "/tmp/project".into(),
             started_at: 0,
         })
+    }
+
+    #[test]
+    fn push_chat_caps_at_max_and_drops_oldest() {
+        let mut s = make_session();
+        for i in 0..(MAX_CONVERSATION + 50) {
+            s.push_chat(ChatRole::Assistant, ChatKind::Text, format!("m{i}"));
+        }
+        assert_eq!(s.conversation.len(), MAX_CONVERSATION);
+        assert_eq!(s.conversation.first().unwrap().text, "m50"); // oldest 50 dropped
+        assert_eq!(
+            s.conversation.last().unwrap().text,
+            format!("m{}", MAX_CONVERSATION + 49)
+        );
+    }
+
+    #[test]
+    fn push_chat_ignores_blank_text() {
+        let mut s = make_session();
+        s.push_chat(ChatRole::User, ChatKind::Text, "   \n ".into());
+        assert!(s.conversation.is_empty());
     }
 
     #[test]

@@ -468,6 +468,12 @@ pub struct App {
     // ── Brain review overlay state ─────────────────────────────────────────
     /// Whether the brain review/scorecard overlay is open.
     pub show_brain: bool,
+    /// Phase 4 conversation view: whether the chat overlay is open, which agent
+    /// it's pinned to (by PID, so roster reordering doesn't switch it), and how
+    /// far it's scrolled back from the newest message (0 = pinned to bottom).
+    pub show_chat: bool,
+    pub chat_pid: Option<u32>,
+    pub chat_scroll: u16,
     /// Which tab is currently active inside the brain overlay.
     pub brain_tab: BrainTab,
     /// Currently selected index into `brain_queue`.
@@ -729,6 +735,9 @@ impl App {
             hive_join_input_mode: false,
             hive_join_buffer: String::new(),
             show_brain: false,
+            show_chat: false,
+            chat_pid: None,
+            chat_scroll: 0,
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
             brain_queue: Vec::new(),
@@ -2194,6 +2203,12 @@ impl App {
             return true;
         }
 
+        // Chat overlay (Phase 4): j/k scroll, g/G ends, Esc/C close.
+        if self.show_chat {
+            self.handle_chat_key(key);
+            return true;
+        }
+
         // Override reason prompt: waiting for 1/2/3/Esc
         if self.pending_override_reason.is_some() {
             match key.code {
@@ -2321,6 +2336,51 @@ impl App {
         self.brain_note_buffer.clear();
         self.brain_tab = BrainTab::Scorecard;
         self.show_brain = true;
+    }
+
+    /// Open the Phase 4 chat overlay for the selected agent, pinned to its PID.
+    /// No-op (with a hint) when a project header — not an agent — is selected.
+    pub fn open_chat(&mut self) {
+        match self.selected_session() {
+            Some(s) => {
+                self.chat_pid = Some(s.pid);
+                self.chat_scroll = 0; // start pinned to the newest message
+                self.show_chat = true;
+            }
+            None => {
+                self.status_msg = "Select an agent to open its chat".into();
+            }
+        }
+    }
+
+    /// Chat overlay keymap: scroll the conversation, jump to ends, close.
+    fn handle_chat_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('C') | KeyCode::Char('q') => {
+                self.show_chat = false;
+                self.chat_pid = None;
+            }
+            // Higher scroll = further back toward the oldest message.
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.chat_scroll = self.chat_scroll.saturating_add(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.chat_scroll = self.chat_scroll.saturating_sub(1);
+            }
+            KeyCode::PageUp => {
+                self.chat_scroll = self.chat_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                self.chat_scroll = self.chat_scroll.saturating_sub(10);
+            }
+            KeyCode::Char('g') => {
+                self.chat_scroll = u16::MAX; // oldest (render clamps to range)
+            }
+            KeyCode::Char('G') => {
+                self.chat_scroll = 0; // newest
+            }
+            _ => {}
+        }
     }
 
     pub fn refresh_brain(&mut self) {
@@ -2758,6 +2818,11 @@ impl App {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
                 self.start_git_op(GitOpKind::Pull);
+            }
+            (KeyCode::Char('C'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.open_chat();
             }
             (KeyCode::Char('g'), _) => {
                 self.cancel_pending_kill();

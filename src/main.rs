@@ -145,6 +145,10 @@ fn run<W: io::Write>(
                     ui::skills::render_skills_screen(frame, area, &app);
                     return;
                 }
+                if app.show_chat {
+                    ui::chat::render_chat(frame, area, &app);
+                    return;
+                }
                 ui::table::render(frame, area, &app);
             })?;
             needs_redraw = false;

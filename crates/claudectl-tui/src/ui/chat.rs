@@ -23,7 +23,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     let title = match session {
         Some(s) => format!(
-            " chat · {} (PID {})  —  i reply · j/k scroll · g/G ends · Esc close ",
+            " chat · {} (PID {})  —  type · Enter send · ↑↓ scroll · Esc close ",
             s.display_name(),
             s.pid
         ),
@@ -100,19 +100,12 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), convo);
 
-    // Reply box (Phase 4b): focused = composing, otherwise a hint.
-    let input_line = if app.chat_input_active {
-        Line::from(vec![
-            Span::styled("> ", Style::default().fg(t.input_accent)),
-            Span::raw(app.chat_input.as_str()),
-            Span::styled("▏", Style::default().fg(t.input_accent)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "  i reply  ·  j/k scroll  ·  Esc close",
-            Style::default().fg(t.text_muted),
-        ))
-    };
+    // Reply box (Phase 4b): always focused — type a prompt, Enter sends.
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(t.input_accent)),
+        Span::raw(app.chat_input.as_str()),
+        Span::styled("▏", Style::default().fg(t.input_accent)),
+    ]);
     frame.render_widget(Paragraph::new(input_line), input_area);
 }
 

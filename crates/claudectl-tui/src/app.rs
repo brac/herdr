@@ -474,10 +474,9 @@ pub struct App {
     pub show_chat: bool,
     pub chat_pid: Option<u32>,
     pub chat_scroll: u16,
-    /// Phase 4b reply box: the prompt being composed in the chat overlay, and
-    /// whether the input line is focused (typing) vs. scroll mode.
+    /// Phase 4b reply box: the prompt being composed in the chat overlay. The
+    /// box is always focused for typing — arrows/PgUp/PgDn scroll, Esc closes.
     pub chat_input: String,
-    pub chat_input_active: bool,
     /// Which tab is currently active inside the brain overlay.
     pub brain_tab: BrainTab,
     /// Currently selected index into `brain_queue`.
@@ -743,7 +742,6 @@ impl App {
             chat_pid: None,
             chat_scroll: 0,
             chat_input: String::new(),
-            chat_input_active: false,
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
             brain_queue: Vec::new(),
@@ -2352,7 +2350,6 @@ impl App {
                 self.chat_pid = Some(s.pid);
                 self.chat_scroll = 0; // start pinned to the newest message
                 self.chat_input.clear();
-                self.chat_input_active = false;
                 self.show_chat = true;
             }
             None => {
@@ -2361,41 +2358,28 @@ impl App {
         }
     }
 
-    /// Chat overlay keymap. Two sub-modes: scroll (default) and input (`i`).
-    /// In input mode keystrokes compose a reply; Enter sends it into the agent's
-    /// pane, Esc returns to scroll. In scroll mode, j/k/g/G move, Esc/C/q close.
+    /// Chat overlay keymap. The reply box is always focused so you can type the
+    /// moment the chat opens: printable keys compose a prompt, Enter sends it into
+    /// the agent's pane, Backspace edits. Scrolling uses the arrow/page keys (not
+    /// j/k, which type), and Esc closes. Higher `chat_scroll` = further back.
     fn handle_chat_key(&mut self, key: KeyEvent) {
-        if self.chat_input_active {
-            match key.code {
-                KeyCode::Enter => self.send_chat_input(),
-                KeyCode::Esc => self.chat_input_active = false,
-                KeyCode::Backspace => {
-                    self.chat_input.pop();
-                }
-                KeyCode::Char(c) => self.chat_input.push(c),
-                _ => {}
-            }
-            return;
-        }
-
         match key.code {
-            KeyCode::Char('i') => self.chat_input_active = true,
-            KeyCode::Esc | KeyCode::Char('C') | KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.show_chat = false;
                 self.chat_pid = None;
                 self.chat_input.clear();
             }
-            // Higher scroll = further back toward the oldest message.
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.chat_scroll = self.chat_scroll.saturating_add(1);
+            KeyCode::Enter => self.send_chat_input(),
+            KeyCode::Backspace => {
+                self.chat_input.pop();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.chat_scroll = self.chat_scroll.saturating_sub(1);
-            }
+            KeyCode::Up => self.chat_scroll = self.chat_scroll.saturating_add(1),
+            KeyCode::Down => self.chat_scroll = self.chat_scroll.saturating_sub(1),
             KeyCode::PageUp => self.chat_scroll = self.chat_scroll.saturating_add(10),
             KeyCode::PageDown => self.chat_scroll = self.chat_scroll.saturating_sub(10),
-            KeyCode::Char('g') => self.chat_scroll = u16::MAX, // oldest (render clamps)
-            KeyCode::Char('G') => self.chat_scroll = 0,        // newest
+            KeyCode::Home => self.chat_scroll = u16::MAX, // oldest (render clamps)
+            KeyCode::End => self.chat_scroll = 0,         // newest
+            KeyCode::Char(c) => self.chat_input.push(c),
             _ => {}
         }
     }
@@ -4117,15 +4101,17 @@ mod tests {
     }
 
     #[test]
-    fn chat_i_focuses_input_and_esc_returns_to_scroll() {
+    fn chat_types_immediately_and_esc_closes() {
         let mut app = App::new();
         app.show_chat = true;
-        app.chat_input_active = false;
-        app.handle_chat_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(app.chat_input_active, "i should focus the reply box");
+        app.chat_pid = Some(1);
+        // No `i` step — printable keys compose the prompt right away.
+        for c in ['h', 'i'] {
+            app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.chat_input, "hi");
         app.handle_chat_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.chat_input_active, "Esc should return to scroll mode");
-        assert!(app.show_chat, "Esc from input must not close the chat");
+        assert!(!app.show_chat, "Esc should close the chat");
     }
 
     #[test]
@@ -4134,7 +4120,6 @@ mod tests {
         app.sessions = Vec::new();
         app.show_chat = true;
         app.chat_pid = Some(999); // no such session
-        app.chat_input_active = true;
         for c in ['h', 'i'] {
             app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }

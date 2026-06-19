@@ -21,6 +21,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use claudectl_core::discovery;
@@ -146,7 +147,14 @@ fn run<W: io::Write>(
                     return;
                 }
                 if app.show_chat {
-                    ui::chat::render_chat(frame, area, &app);
+                    // Embedded split (like the detail panel): roster on top for
+                    // context, the focused agent's chat below — both visible.
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .split(area);
+                    ui::table::render(frame, chunks[0], &app);
+                    ui::chat::render_chat(frame, chunks[1], &app);
                     return;
                 }
                 ui::table::render(frame, area, &app);

@@ -260,12 +260,26 @@ pub fn resolve_worktree_ids(sessions: &mut [ClaudeSession]) {
     }
 }
 
+/// Map a working directory to Claude Code's transcript-dir slug under
+/// `~/.claude/projects/`. Claude Code replaces **every non-alphanumeric
+/// character** (path separators, spaces, dots, underscores, …) with `-`,
+/// preserving case — e.g. `/mnt/c/Users/Ben Bracamonte/Work/burnRat`
+/// → `-mnt-c-Users-Ben-Bracamonte-Work-burnRat`.
+///
+/// A previous version replaced only `/`, so any project path containing a
+/// space or dot computed the wrong slug and silently failed to match its
+/// transcript dir (verified on a `…/Ben Bracamonte/…` machine). Mirror the
+/// real rule (confirmed against live `~/.claude/projects/` dirs and
+/// agent-deck's `ConvertToClaudeDirName`); never re-derive it loosely (§8).
 fn cwd_to_slug(cwd: &str) -> String {
     let trimmed = cwd.trim_end_matches('/');
     if trimmed.is_empty() {
         return "-".to_string();
     }
-    trimmed.replace('/', "-")
+    trimmed
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Remove session JSON files for dead PIDs whose files are older than 24 hours.
@@ -361,5 +375,29 @@ mod tests {
     #[test]
     fn slug_single_component() {
         assert_eq!(cwd_to_slug("/tmp"), "-tmp");
+    }
+
+    #[test]
+    fn slug_replaces_spaces() {
+        // Regression: paths with spaces (e.g. Windows "Ben Bracamonte") must
+        // hyphenate the space, matching Claude Code's real transcript dir.
+        assert_eq!(
+            cwd_to_slug("/mnt/c/Users/Ben Bracamonte/Work/herdr"),
+            "-mnt-c-Users-Ben-Bracamonte-Work-herdr"
+        );
+    }
+
+    #[test]
+    fn slug_replaces_dots_and_underscores() {
+        assert_eq!(
+            cwd_to_slug("/Users/dev/brac.dev/my_app"),
+            "-Users-dev-brac-dev-my-app"
+        );
+    }
+
+    #[test]
+    fn slug_preserves_case() {
+        // burnRat keeps its capital R on disk — no lowercasing.
+        assert_eq!(cwd_to_slug("/Work/burnRat"), "-Work-burnRat");
     }
 }

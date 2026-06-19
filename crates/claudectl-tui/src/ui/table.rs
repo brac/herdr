@@ -40,8 +40,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .split(area)
         .to_vec();
 
-    // Empty state: show onboarding message when no sessions found
-    if app.sessions.is_empty() {
+    // Empty state: onboarding only when there is nothing to show at all — no
+    // agents AND no projects. Project-first (§2): an empty agent list still
+    // renders the project roster (all idle) below.
+    if app.sessions.is_empty() && app.projects.is_empty() {
         let launch_hint = if claudectl_core::terminals::can_launch_session() {
             "  Press n for the launch wizard, or start claude in another terminal."
         } else {
@@ -51,14 +53,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
-                "No active Claude Code sessions found.",
+                "No projects or active agents found here.",
                 Style::default()
                     .fg(t.text_muted)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(launch_hint),
-            Line::from("  Run claudectl --doctor if terminal switching or launch fails."),
+            Line::from("  Or launch herdr from the parent directory of your project repos."),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Press ", Style::default().fg(t.text_muted)),
@@ -80,7 +82,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ];
 
         let block = Block::default()
-            .title(" claudectl ")
+            .title(" herdr ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(t.border));
 
@@ -100,7 +102,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    if visible_sessions.is_empty() {
+    if visible_sessions.is_empty() && !app.grouped_view {
         let empty_lines = vec![
             Line::from(""),
             Line::from(""),
@@ -117,7 +119,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ];
 
         let block = Block::default()
-            .title(" claudectl ")
+            .title(" herdr ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(t.border));
 
@@ -178,19 +180,29 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("${:.1}", group.total_cost)
             };
-            let header_text = format!(
-                "{} ({} sessions, {} active, {}, ctx {:.0}%)",
-                group.name,
-                group.session_count,
-                group.active_count,
-                cost_str,
-                group.avg_context_pct
-            );
-            let mut cells: Vec<Cell> = vec![
-                Cell::from(""),
-                Cell::from(header_text)
-                    .style(Style::default().fg(t.header).add_modifier(Modifier::BOLD)),
-            ];
+            // Idle projects (no agents) render as just the dim project name —
+            // the absence of child rows conveys "no agents", and the narrow
+            // Project column can't fit more. Git status gets its own column in
+            // the Phase 3 light path. Active projects show the full aggregate.
+            let header_text = if group.session_count == 0 {
+                group.name.clone()
+            } else {
+                format!(
+                    "{} ({} sessions, {} active, {}, ctx {:.0}%)",
+                    group.name,
+                    group.session_count,
+                    group.active_count,
+                    cost_str,
+                    group.avg_context_pct
+                )
+            };
+            let header_style = if group.session_count == 0 {
+                Style::default().fg(t.header).add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(t.header).add_modifier(Modifier::BOLD)
+            };
+            let mut cells: Vec<Cell> =
+                vec![Cell::from(""), Cell::from(header_text).style(header_style)];
             for _ in 2..11 {
                 cells.push(Cell::from(""));
             }
@@ -201,7 +213,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             for s in visible_sessions
                 .iter()
                 .copied()
-                .filter(|s| s.project_name == group.name)
+                .filter(|s| group.pids.contains(&s.pid))
             {
                 if Some(s.pid) == selected_pid {
                     selected_row_idx = Some(row_idx);
@@ -339,10 +351,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
 
-    let mut title_spans: Vec<Span> = vec![Span::styled(
-        " claudectl ",
-        Style::default().fg(t.text_primary),
-    )];
+    let mut title_spans: Vec<Span> =
+        vec![Span::styled(" herdr ", Style::default().fg(t.text_primary))];
 
     if !rec_indicator.is_empty() {
         title_spans.push(Span::styled(

@@ -124,15 +124,25 @@ app refactor (§9: inherit, don't rewrite):
 | TUI renders + input + clean exit | ✅ full frame via PTY; `q` quits, terminal restored (panic-safe §3) |
 | Modules understood | ✅ this document |
 
-## Phase 1 hand-off — the project-first inversion seam (CLAUDE.md §2)
+## Phase 1 — project-first inversion (CLAUDE.md §2) — DONE
 
-Today the spine is **session-first**: `App.sessions: Vec<ClaudeSession>`, rendered flat by
-`ui::table::render`. Phase 1 inverts to **project-first**:
-1. New top-level entity = a project dir from `read_dir` on the parent the tool launches in
-   (default filter: dirs containing `.git` — observed **53 of 77** dirs under `~/Work`; resolves
-   open-question #1). Depth: one level (resolves #2).
-2. Group existing `ClaudeSession`s under their project by matching `session.cwd` → project path
-   (reuse `cwd_to_slug`'s inverse intuition; the cwd is already on each session).
-3. Rewrite `ui::table::render` into a project roster, each row expandable to its 0..N agents.
-4. While rewriting `app.rs`, excise the three dormant residuals above.
+The spine is now **project-first**. New `claudectl-core/src/projects.rs` (`Project { path, name,
+has_git }`, `scan(parent, include_non_git)`, `contains_cwd`) discovers project dirs by `read_dir` on
+the parent herdr launches in — depth 1, `.git` filter by default (`--all` widens). `App` gained
+`parent_dir` + `projects` (scanned each `refresh()`), a `with_parent()` constructor, and an inverted
+`project_groups()`: it seeds one group per scanned project (zero-agent projects included) and attaches
+each session by **canonical `cwd` path** match, with an `(other)` bucket for out-of-tree agents.
+`ui::table::render` reuses the existing grouped layout, now with idle-project headers; title rebranded.
+
+- **Gate met:** from `~/Work`, herdr shows **54 projects**, `herdr` active with its agent nested,
+  53 idle projects below. `examples/projects` proves it TTY-free; clippy `-D warnings` clean;
+  **132 tests** (121 core incl. 6 new + 11 tui); 0 async deps; 1.3 MB binary.
+- **CLI:** `herdr [--all] [PARENT_DIR]` (no clap — std arg parse).
+- **Deferred (not gate):** project-header collapse/expand selection (Phase 1.5); a spanning-width
+  group-header row so long idle names don't truncate in the narrow Project column; excising the
+  dormant `rules`/`Orchestrator` residuals (left untouched — `project_groups` no longer reads them and
+  they remain inert under herdr's defaults; cleaner to remove alongside the Phase 4 app refactor).
+
+→ Unblocks **Phase 2 (launch)**: `tmux new-window -c {project.path}` + `claude`, via the inherited
+`launch.rs` / `terminals::launch_session`.
 No new dependencies required; this is a pure data-model + render refactor on the inherited layer.

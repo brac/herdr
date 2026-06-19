@@ -7,11 +7,13 @@
 //! so every piece of live state comes from direct `~/.claude` session
 //! discovery — no async runtime, no SQLite, no MCP server.
 //!
-//! The project-first inversion (CLAUDE.md §2) is Phase 1 and lands on top of
-//! this; for now the roster is upstream's session-first table, proven against
-//! live data to close the Phase 0 gate.
+//! Phase 1 (CLAUDE.md §2): the roster is project-first. herdr scans the parent
+//! directory it is launched from for project repos and nests each project's
+//! live agents beneath it. Usage: `herdr [--all] [PARENT_DIR]`.
+#![allow(clippy::collapsible_if)] // keep the nested poll/read/handle_key block flat, as upstream does
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -28,11 +30,42 @@ use claudectl_tui::{app::App, ui};
 const TICK_RATE: Duration = Duration::from_secs(2);
 
 fn main() -> io::Result<()> {
+    let opts = Options::from_args();
     install_panic_restore();
     let mut terminal = enter_tui()?;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, opts);
     leave_tui(&mut terminal)?;
     result
+}
+
+/// Minimal CLI: `herdr [--all] [PARENT_DIR]`. No clap — a single optional path
+/// and one flag don't justify the dependency (CLAUDE.md §3).
+struct Options {
+    /// Parent directory to scan for projects (default: current dir).
+    parent: PathBuf,
+    /// Include non-git subdirectories in the project roster (default: .git only).
+    include_non_git: bool,
+}
+
+impl Options {
+    fn from_args() -> Self {
+        let mut parent: Option<PathBuf> = None;
+        let mut include_non_git = false;
+        for arg in std::env::args().skip(1) {
+            match arg.as_str() {
+                "--all" | "-a" => include_non_git = true,
+                _ if parent.is_none() => parent = Some(PathBuf::from(arg)),
+                _ => {}
+            }
+        }
+        let parent = parent
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            parent,
+            include_non_git,
+        }
+    }
 }
 
 /// Install a panic hook that restores the terminal before the default handler
@@ -62,11 +95,19 @@ fn leave_tui<W: io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::
 
 /// The synchronous poll loop: draw → wait for input up to the next tick →
 /// refresh on tick. Returns when the user quits (`handle_key` returns false).
-fn run<W: io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Result<()> {
-    // App::new() discovers live sessions and defaults to MockRuntime, so there
-    // is no orchestrator wiring to do here (cf. upstream `run_tui`, which swaps
-    // in a live brain/coord/bus runtime — deliberately omitted).
-    let mut app = App::new();
+fn run<W: io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    opts: Options,
+) -> io::Result<()> {
+    // App::with_parent() scans the parent dir for projects and discovers live
+    // sessions, defaulting to MockRuntime — so there is no orchestrator wiring
+    // to do here (cf. upstream `run_tui`, which swaps in a live brain/coord/bus
+    // runtime — deliberately omitted).
+    let mut app = App::with_parent(opts.parent);
+    if opts.include_non_git {
+        app.include_non_git = true;
+        app.refresh(); // re-scan now that the widen flag is set
+    }
     let mut last_tick = Instant::now();
 
     loop {

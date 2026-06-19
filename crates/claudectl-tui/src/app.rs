@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
@@ -11,6 +12,7 @@ use claudectl_core::hooks::{HookEvent, HookRegistry};
 use claudectl_core::launch::{self, LaunchRequest};
 use claudectl_core::monitor;
 use claudectl_core::process;
+use claudectl_core::projects::{self, Project};
 use claudectl_core::session::{ClaudeSession, SessionStatus};
 use claudectl_core::terminals;
 use claudectl_core::theme::Theme;
@@ -250,6 +252,13 @@ fn compact_value(value: &str, empty_label: &str) -> String {
 
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
+    /// Parent dir herdr was launched from; the project roster scans this (§2).
+    pub parent_dir: PathBuf,
+    /// Project directories discovered under `parent_dir`. Project-first: these
+    /// exist whether or not they currently host any agents.
+    pub projects: Vec<Project>,
+    /// Widen the project scan to non-git subdirectories (default false = .git only).
+    pub include_non_git: bool,
     pub table_state: TableState,
     pub should_quit: bool,
     pub status_msg: String,
@@ -528,8 +537,17 @@ fn observation_from(
 
 impl App {
     pub fn new() -> Self {
+        Self::with_parent(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// Construct against a specific parent directory (the project roster root).
+    /// `new()` delegates here with the process's current dir.
+    pub fn with_parent(parent_dir: PathBuf) -> Self {
         let mut app = Self {
             sessions: Vec::new(),
+            parent_dir,
+            projects: Vec::new(),
+            include_non_git: false,
             table_state: TableState::default(),
             should_quit: false,
             status_msg: String::new(),
@@ -551,7 +569,7 @@ impl App {
             finished_at: HashMap::new(),
             debug: false,
             debug_timings: DebugTimings::default(),
-            grouped_view: false,
+            grouped_view: true,
             detail_panel: false,
             webhook_url: None,
             webhook_filter: None,
@@ -662,6 +680,10 @@ impl App {
             }
             return;
         }
+
+        // Project-first roster: scan the parent dir for project directories.
+        // Cheap local read; projects exist independent of agents (§2).
+        self.projects = projects::scan(&self.parent_dir, self.include_non_git);
 
         // Discover which PIDs have session files
         let scan_start = std::time::Instant::now();
@@ -3011,52 +3033,112 @@ impl App {
 #[derive(Debug, Clone)]
 pub struct ProjectGroup {
     pub name: String,
+    /// Project directory, or `None` for the synthetic "(other)" bucket.
+    pub path: Option<PathBuf>,
+    pub has_git: bool,
+    /// PIDs of the agents in this project, in roster order (empty = idle project).
+    pub pids: Vec<u32>,
     pub session_count: usize,
     pub active_count: usize,
     pub total_cost: f64,
     pub avg_context_pct: f64,
 }
 
+impl ProjectGroup {
+    fn aggregate(members: &[&ClaudeSession]) -> (usize, f64, f64) {
+        let active = members
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    SessionStatus::Processing | SessionStatus::NeedsInput
+                )
+            })
+            .count();
+        let cost: f64 = members.iter().map(|s| s.cost_usd).sum();
+        let avg_ctx = if members.is_empty() {
+            0.0
+        } else {
+            members.iter().map(|s| s.context_percent()).sum::<f64>() / members.len() as f64
+        };
+        (active, cost, avg_ctx)
+    }
+
+    fn new(name: String, path: Option<PathBuf>, has_git: bool, members: &[&ClaudeSession]) -> Self {
+        let (active_count, total_cost, avg_context_pct) = Self::aggregate(members);
+        Self {
+            name,
+            path,
+            has_git,
+            pids: members.iter().map(|s| s.pid).collect(),
+            session_count: members.len(),
+            active_count,
+            total_cost,
+            avg_context_pct,
+        }
+    }
+}
+
 impl App {
+    /// Project-first roster (CLAUDE.md §2): one group per scanned project —
+    /// present whether or not it hosts agents — with each visible session
+    /// attached to its project by canonical `cwd` path. Sessions under no
+    /// scanned project fall into a synthetic "(other)" group so none are hidden.
     pub fn project_groups(&self) -> Vec<ProjectGroup> {
-        let mut groups: HashMap<String, Vec<&ClaudeSession>> = HashMap::new();
-        for s in self.visible_sessions() {
-            groups.entry(s.project_name.clone()).or_default().push(s);
+        // Canonicalize so matching survives symlinks (e.g. /Users vs /private on
+        // macOS). Falls back to the raw path if the dir can't be resolved.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+
+        let sessions: Vec<&ClaudeSession> = self.visible_sessions();
+        let session_paths: Vec<PathBuf> =
+            sessions.iter().map(|s| canon(Path::new(&s.cwd))).collect();
+        let mut assigned = vec![false; sessions.len()];
+
+        let mut result: Vec<ProjectGroup> = Vec::with_capacity(self.projects.len() + 1);
+        for proj in &self.projects {
+            let proj_canon = canon(&proj.path);
+            let mut members: Vec<&ClaudeSession> = Vec::new();
+            for (i, s) in sessions.iter().enumerate() {
+                if !assigned[i] && projects::contains_cwd(&proj_canon, &session_paths[i]) {
+                    assigned[i] = true;
+                    members.push(s);
+                }
+            }
+            result.push(ProjectGroup::new(
+                proj.name.clone(),
+                Some(proj.path.clone()),
+                proj.has_git,
+                &members,
+            ));
         }
 
-        let mut result: Vec<ProjectGroup> = groups
-            .into_iter()
-            .map(|(name, sessions)| {
-                let active_count = sessions
-                    .iter()
-                    .filter(|s| {
-                        matches!(
-                            s.status,
-                            SessionStatus::Processing | SessionStatus::NeedsInput
-                        )
-                    })
-                    .count();
-                let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
-                let avg_context_pct = if sessions.is_empty() {
-                    0.0
-                } else {
-                    sessions.iter().map(|s| s.context_percent()).sum::<f64>()
-                        / sessions.len() as f64
-                };
-                ProjectGroup {
-                    name,
-                    session_count: sessions.len(),
-                    active_count,
-                    total_cost,
-                    avg_context_pct,
-                }
-            })
+        let orphans: Vec<&ClaudeSession> = sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !assigned[*i])
+            .map(|(_, s)| *s)
             .collect();
+        if !orphans.is_empty() {
+            result.push(ProjectGroup::new(
+                "(other)".to_string(),
+                None,
+                false,
+                &orphans,
+            ));
+        }
 
+        // Projects hosting agents first (by cost desc), then idle projects by name.
         result.sort_by(|a, b| {
-            b.total_cost
-                .partial_cmp(&a.total_cost)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_active = a.session_count > 0;
+            let b_active = b.session_count > 0;
+            b_active
+                .cmp(&a_active)
+                .then_with(|| {
+                    b.total_cost
+                        .partial_cmp(&a.total_cost)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.name.cmp(&b.name))
         });
         result
     }

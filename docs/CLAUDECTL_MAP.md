@@ -334,3 +334,25 @@ Read an agent's exchange in-cockpit (CLAUDE.md §5, PHASE4_PLAN.md Part A).
   release **1.61 MB**; **no new dependencies**.
 - **Next:** 4b (input → send_input into the agent's pane) and 4c (approve/deny/interrupt
   + `capture-pane` prompt preview).
+
+## Phase 4b — send prompts from the chat (interactive) — DONE
+
+Drive an agent from the chat overlay (CLAUDE.md §0, PHASE4_PLAN.md Part B).
+
+- The chat overlay gained a reply box (bottom row) and two sub-modes: scroll
+  (default) and input (`i`). In input mode keystrokes compose a prompt; Enter
+  sends, Esc returns to scroll. State: `chat_input`/`chat_input_active`.
+- `send_chat_input` injects into the agent's **existing** tmux pane via the
+  inherited `terminals::send_input` — types the text, then `\r` to submit
+  (mirrors `approve_session`). tmux still owns the process; herdr is a remote
+  control (§0), not a launcher. The reply streams back into the conversation on
+  the next transcript refresh (no optimistic echo → no duplicate when Claude
+  records the user turn). Remote/worker sessions and missing agents are blocked
+  with a status message; a failed send keeps the draft.
+- Note: the existing `i` roster input used the dormant `MockRuntime` (inert in
+  herdr); the chat uses the **real** terminals backend.
+- **Green:** 166 tests (input focus toggle, typing, remote/missing-agent send
+  guards — the success path needs a live tmux pane, a manual step); clippy
+  `-D warnings` clean; no new dependencies (no `tui-textarea` — a single-line
+  hand-rolled buffer suffices for prompts; multiline deferred).
+- **Next:** 4c — approve/deny/interrupt + `tmux capture-pane` permission preview.

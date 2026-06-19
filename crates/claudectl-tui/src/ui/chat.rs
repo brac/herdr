@@ -23,7 +23,7 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     let title = match session {
         Some(s) => format!(
-            " chat · {} (PID {})  —  j/k scroll · g/G ends · Esc close ",
+            " chat · {} (PID {})  —  i reply · j/k scroll · g/G ends · Esc close ",
             s.display_name(),
             s.pid
         ),
@@ -44,8 +44,20 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
+    // Reserve the bottom row for the reply box; the conversation fills the rest.
+    let input_h = 1;
+    let convo = Rect {
+        height: inner.height.saturating_sub(input_h),
+        ..inner
+    };
+    let input_area = Rect {
+        y: inner.y + convo.height,
+        height: input_h.min(inner.height),
+        ..inner
+    };
+
     // Bubbles take ~70% of the width so left/right alignment reads as a chat.
-    let width = inner.width.max(10) as usize;
+    let width = convo.width.max(10) as usize;
     let bubble_w = (width * 7 / 10).max(8);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -82,11 +94,26 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     // Scroll: `chat_scroll` counts lines back from the newest. 0 pins the view to
     // the bottom (newest), so a live agent's messages appear as they arrive.
     let total = lines.len() as u16;
-    let max_off = total.saturating_sub(inner.height);
+    let max_off = total.saturating_sub(convo.height);
     let scroll = app.chat_scroll.min(max_off);
     let offset = max_off.saturating_sub(scroll);
 
-    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), convo);
+
+    // Reply box (Phase 4b): focused = composing, otherwise a hint.
+    let input_line = if app.chat_input_active {
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(t.input_accent)),
+            Span::raw(app.chat_input.as_str()),
+            Span::styled("▏", Style::default().fg(t.input_accent)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  i reply  ·  j/k scroll  ·  Esc close",
+            Style::default().fg(t.text_muted),
+        ))
+    };
+    frame.render_widget(Paragraph::new(input_line), input_area);
 }
 
 /// Simple greedy word-wrap to `width` columns (no dependency). Preserves

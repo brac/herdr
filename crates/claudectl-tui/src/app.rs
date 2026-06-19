@@ -474,6 +474,10 @@ pub struct App {
     pub show_chat: bool,
     pub chat_pid: Option<u32>,
     pub chat_scroll: u16,
+    /// Phase 4b reply box: the prompt being composed in the chat overlay, and
+    /// whether the input line is focused (typing) vs. scroll mode.
+    pub chat_input: String,
+    pub chat_input_active: bool,
     /// Which tab is currently active inside the brain overlay.
     pub brain_tab: BrainTab,
     /// Currently selected index into `brain_queue`.
@@ -738,6 +742,8 @@ impl App {
             show_chat: false,
             chat_pid: None,
             chat_scroll: 0,
+            chat_input: String::new(),
+            chat_input_active: false,
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
             brain_queue: Vec::new(),
@@ -2345,6 +2351,8 @@ impl App {
             Some(s) => {
                 self.chat_pid = Some(s.pid);
                 self.chat_scroll = 0; // start pinned to the newest message
+                self.chat_input.clear();
+                self.chat_input_active = false;
                 self.show_chat = true;
             }
             None => {
@@ -2353,12 +2361,29 @@ impl App {
         }
     }
 
-    /// Chat overlay keymap: scroll the conversation, jump to ends, close.
+    /// Chat overlay keymap. Two sub-modes: scroll (default) and input (`i`).
+    /// In input mode keystrokes compose a reply; Enter sends it into the agent's
+    /// pane, Esc returns to scroll. In scroll mode, j/k/g/G move, Esc/C/q close.
     fn handle_chat_key(&mut self, key: KeyEvent) {
+        if self.chat_input_active {
+            match key.code {
+                KeyCode::Enter => self.send_chat_input(),
+                KeyCode::Esc => self.chat_input_active = false,
+                KeyCode::Backspace => {
+                    self.chat_input.pop();
+                }
+                KeyCode::Char(c) => self.chat_input.push(c),
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
+            KeyCode::Char('i') => self.chat_input_active = true,
             KeyCode::Esc | KeyCode::Char('C') | KeyCode::Char('q') => {
                 self.show_chat = false;
                 self.chat_pid = None;
+                self.chat_input.clear();
             }
             // Higher scroll = further back toward the oldest message.
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2367,19 +2392,51 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.chat_scroll = self.chat_scroll.saturating_sub(1);
             }
-            KeyCode::PageUp => {
-                self.chat_scroll = self.chat_scroll.saturating_add(10);
-            }
-            KeyCode::PageDown => {
-                self.chat_scroll = self.chat_scroll.saturating_sub(10);
-            }
-            KeyCode::Char('g') => {
-                self.chat_scroll = u16::MAX; // oldest (render clamps to range)
-            }
-            KeyCode::Char('G') => {
-                self.chat_scroll = 0; // newest
-            }
+            KeyCode::PageUp => self.chat_scroll = self.chat_scroll.saturating_add(10),
+            KeyCode::PageDown => self.chat_scroll = self.chat_scroll.saturating_sub(10),
+            KeyCode::Char('g') => self.chat_scroll = u16::MAX, // oldest (render clamps)
+            KeyCode::Char('G') => self.chat_scroll = 0,        // newest
             _ => {}
+        }
+    }
+
+    /// Phase 4b (CLAUDE.md §0, PHASE4_PLAN.md Part B): send the composed reply
+    /// into the agent's existing tmux pane via the inherited keystroke backend —
+    /// type the text, then `\r` to submit (mirrors `approve_session`). tmux still
+    /// owns the process; we are a remote control. The agent's reply streams back
+    /// into the conversation on the next transcript refresh.
+    fn send_chat_input(&mut self) {
+        let text = self.chat_input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let Some(pid) = self.chat_pid else {
+            return;
+        };
+
+        // Compute the result while borrowing `sessions`, so the borrow is dropped
+        // before we mutate `self` (status/input) below.
+        let outcome = match self.sessions.iter().find(|s| s.pid == pid) {
+            None => Err("Agent is no longer running".to_string()),
+            Some(s) if s.worker_origin.is_some() => {
+                Err("Remote session — input not available".to_string())
+            }
+            Some(s) => {
+                let name = s.display_name().to_string();
+                terminals::send_input(s, &text)
+                    .and_then(|()| terminals::send_input(s, "\r"))
+                    .map(|()| name)
+                    .map_err(|e| format!("Send failed: {e}"))
+            }
+        };
+
+        match outcome {
+            Ok(name) => {
+                self.status_msg = format!("Sent to {name}");
+                self.chat_input.clear();
+                self.chat_scroll = 0; // pin to bottom to watch the reply arrive
+            }
+            Err(msg) => self.status_msg = msg,
         }
     }
 
@@ -4057,6 +4114,47 @@ mod tests {
             app.git_inflight.contains(&path),
             "agent activity in a project should re-fetch its git status"
         );
+    }
+
+    #[test]
+    fn chat_i_focuses_input_and_esc_returns_to_scroll() {
+        let mut app = App::new();
+        app.show_chat = true;
+        app.chat_input_active = false;
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(app.chat_input_active, "i should focus the reply box");
+        app.handle_chat_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.chat_input_active, "Esc should return to scroll mode");
+        assert!(app.show_chat, "Esc from input must not close the chat");
+    }
+
+    #[test]
+    fn chat_input_types_and_send_to_missing_agent_keeps_buffer() {
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        app.show_chat = true;
+        app.chat_pid = Some(999); // no such session
+        app.chat_input_active = true;
+        for c in ['h', 'i'] {
+            app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.chat_input, "hi");
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_msg.contains("no longer running"));
+        assert_eq!(app.chat_input, "hi", "a failed send must not clear the draft");
+    }
+
+    #[test]
+    fn send_chat_input_blocks_remote_sessions() {
+        let mut app = App::new();
+        let mut s = make_session(7, "remote-proj", "opus", SessionStatus::Processing, 0.0, 0.0, true);
+        s.worker_origin = Some("worker-1".into());
+        app.sessions = vec![s];
+        app.chat_pid = Some(7);
+        app.chat_input = "do a thing".into();
+        app.send_chat_input();
+        assert!(app.status_msg.contains("Remote session"));
+        assert_eq!(app.chat_input, "do a thing", "remote send must not clear the draft");
     }
 
     #[test]

@@ -994,6 +994,24 @@ pub fn stage_pane(target: &str, previous: Option<&str>) -> Result<(), String> {
     tmux::join_into_herdr(target)
 }
 
+/// Resize herdr's own pane to `rows` tall (the stage split sizes the agent to
+/// fill the rest). No-op outside tmux. Errors are non-fatal — tmux clamps.
+pub fn resize_stage_top(rows: u16) -> Result<(), String> {
+    if !matches!(detect_terminal(), Terminal::Tmux) {
+        return Ok(());
+    }
+    let herdr = std::env::var("TMUX_PANE").map_err(|_| "herdr is not inside tmux".to_string())?;
+    let output = std::process::Command::new("tmux")
+        .args(["resize-pane", "-t", &herdr, "-y", &rows.to_string()])
+        .output()
+        .map_err(|e| format!("tmux resize-pane failed: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// Hide a staged pane (break it back out to its own window). No-op outside tmux.
 pub fn unstage_pane(pane: &str) -> Result<(), String> {
     if matches!(detect_terminal(), Terminal::Tmux) {

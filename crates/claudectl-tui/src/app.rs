@@ -3015,6 +3015,7 @@ impl App {
                 // In tmux, `target` is the new pane id — track it as the stage.
                 if in_tmux {
                     self.staged_pane = Some(target);
+                    let _ = terminals::resize_stage_top(self.stage_top_rows());
                 }
                 format!("Launched agent at {path}")
             }
@@ -3054,6 +3055,7 @@ impl App {
         match terminals::stage_pane(&pane, previous.as_deref()) {
             Ok(()) => {
                 self.staged_pane = Some(pane);
+                let _ = terminals::resize_stage_top(self.stage_top_rows());
                 self.status_msg = "Viewing agent (Ctrl-b ↓ to type · o to hide)".into();
             }
             Err(e) => {
@@ -3099,6 +3101,7 @@ impl App {
                 self.launch_form = LaunchForm::default();
                 if in_tmux {
                     self.staged_pane = Some(target);
+                    let _ = terminals::resize_stage_top(self.stage_top_rows());
                 }
                 self.status_msg = format!(
                     "Launched session at {}{}",
@@ -3757,6 +3760,27 @@ impl App {
     /// and clamping operate over this, not the bare session count.
     pub fn roster_len(&self) -> usize {
         self.roster_layout().1.len()
+    }
+
+    /// Rows herdr's pane needs to show the roster without scrolling: one per
+    /// roster row (agents add their subagent rows) plus chrome (table header,
+    /// footer, status, borders). Clamped so it never eats the whole window. Used
+    /// to auto-size herdr's pane when an agent is staged below it.
+    fn stage_top_rows(&self) -> u16 {
+        let (_, rows) = self.roster_layout();
+        let visual: usize = rows
+            .iter()
+            .map(|row| match row {
+                RosterRow::Header(_) => 1,
+                RosterRow::Agent(si) => {
+                    1 + self
+                        .sessions
+                        .get(*si)
+                        .map_or(0, |s| s.subagent_breakdown().len())
+                }
+            })
+            .sum();
+        ((visual + 4) as u16).clamp(6, 40)
     }
 
     /// Working directory to launch a new agent into, derived from the current

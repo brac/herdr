@@ -66,7 +66,26 @@ fn main() {
                 } else {
                     "project"
                 };
-                println!("  [{i:>2}] {kind:<14} {}", g.name);
+                // Phase 3 light path: show the git glance per project header.
+                let git = match &g.git {
+                    None => String::new(),
+                    Some(s) if s.bare => "  (bare)".to_string(),
+                    Some(s) => {
+                        let dirty = if s.dirty { " ●" } else { "" };
+                        let ahead = if s.upstream && s.ahead > 0 {
+                            format!(" ↑{}", s.ahead)
+                        } else {
+                            String::new()
+                        };
+                        let behind = if s.upstream && s.behind > 0 {
+                            format!(" ↓{}", s.behind)
+                        } else {
+                            String::new()
+                        };
+                        format!("  [{}{dirty}{ahead}{behind}]", s.branch)
+                    }
+                };
+                println!("  [{i:>2}] {kind:<14} {}{git}", g.name);
             }
             RosterRow::Agent(si) => {
                 if let Some(s) = app.sessions.get(*si) {

@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
 use claudectl_core::discovery;
+use claudectl_core::git::{self, GitStatus};
 use claudectl_core::helpers::{
     create_aggregate_session, dirs_home, fire_notification, fire_webhook,
 };
@@ -250,6 +252,12 @@ fn compact_value(value: &str, empty_label: &str) -> String {
     }
 }
 
+/// How long a project's cached git status stays fresh before recompute. Git
+/// status rides the safety-net tick — it is *not* file-watched (watching ~53
+/// `.git` trees isn't worth it; PHASE3_PLAN.md) — so a 10s TTL keeps the glance
+/// current without spawning a `git` per project on every tick.
+const GIT_STATUS_TTL: Duration = Duration::from_secs(10);
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -259,6 +267,9 @@ pub struct App {
     pub projects: Vec<Project>,
     /// Widen the project scan to non-git subdirectories (default false = .git only).
     pub include_non_git: bool,
+    /// Per-project git status (Phase 3), keyed by project path with the instant
+    /// it was computed. Throttled by `GIT_STATUS_TTL`; see `refresh_git_cache`.
+    pub git_cache: HashMap<PathBuf, (Instant, GitStatus)>,
     pub table_state: TableState,
     pub should_quit: bool,
     pub status_msg: String,
@@ -548,6 +559,7 @@ impl App {
             parent_dir,
             projects: Vec::new(),
             include_non_git: false,
+            git_cache: HashMap::new(),
             table_state: TableState::default(),
             should_quit: false,
             status_msg: String::new(),
@@ -684,6 +696,7 @@ impl App {
         // Project-first roster: scan the parent dir for project directories.
         // Cheap local read; projects exist independent of agents (§2).
         self.projects = projects::scan(&self.parent_dir, self.include_non_git);
+        self.refresh_git_cache();
 
         // Discover which PIDs have session files
         let scan_start = std::time::Instant::now();
@@ -1109,6 +1122,44 @@ impl App {
                 jsonl_elapsed.as_secs_f64() * 1000.0,
                 total_elapsed.as_secs_f64() * 1000.0,
             );
+        }
+    }
+
+    /// Refresh the per-project git-status cache (Phase 3 light path). Recompute a
+    /// project's status only when its entry is missing or older than
+    /// `GIT_STATUS_TTL`, prune entries for projects that vanished, and skip
+    /// non-git dirs. A `git::status` that returns `None` (git missing, transient
+    /// error) drops the entry so the roster shows no segment rather than stale
+    /// data. Cheap and throttled — fine to call every `refresh()` (§3).
+    fn refresh_git_cache(&mut self) {
+        let now = Instant::now();
+        // Live git-project paths this scan. Owned so we don't hold a borrow on
+        // `self.projects` while mutating `self.git_cache`.
+        let live: HashSet<PathBuf> = self
+            .projects
+            .iter()
+            .filter(|p| p.has_git)
+            .map(|p| p.path.clone())
+            .collect();
+
+        self.git_cache.retain(|path, _| live.contains(path));
+
+        for path in &live {
+            let stale = self
+                .git_cache
+                .get(path)
+                .map(|(t, _)| now.duration_since(*t) >= GIT_STATUS_TTL)
+                .unwrap_or(true);
+            if stale {
+                match git::status(path) {
+                    Some(st) => {
+                        self.git_cache.insert(path.clone(), (now, st));
+                    }
+                    None => {
+                        self.git_cache.remove(path);
+                    }
+                }
+            }
         }
     }
 
@@ -3067,6 +3118,25 @@ pub struct ProjectGroup {
     pub active_count: usize,
     pub total_cost: f64,
     pub avg_context_pct: f64,
+    /// Git status of the project dir (Phase 3 light path); `None` for the
+    /// "(other)" bucket, non-git dirs, or when `git` is unavailable.
+    pub git: Option<GitStatus>,
+    /// Actionability rank of the most-urgent agent (lower = more urgent); used to
+    /// float projects with a blocked agent to the top. `u8::MAX` when idle.
+    pub urgency: u8,
+}
+
+/// Actionability rank for roster ordering (from agent-deck): a blocked agent is
+/// more urgent than a busy or expensive one. Lower sorts first.
+fn status_urgency(status: SessionStatus) -> u8 {
+    match status {
+        SessionStatus::NeedsInput => 0,
+        SessionStatus::Processing => 1,
+        SessionStatus::WaitingInput => 2,
+        SessionStatus::Idle => 3,
+        SessionStatus::Unknown => 4,
+        SessionStatus::Finished => 5,
+    }
 }
 
 impl ProjectGroup {
@@ -3091,6 +3161,11 @@ impl ProjectGroup {
 
     fn new(name: String, path: Option<PathBuf>, has_git: bool, members: &[&ClaudeSession]) -> Self {
         let (active_count, total_cost, avg_context_pct) = Self::aggregate(members);
+        let urgency = members
+            .iter()
+            .map(|s| status_urgency(s.status))
+            .min()
+            .unwrap_or(u8::MAX);
         Self {
             name,
             path,
@@ -3100,6 +3175,8 @@ impl ProjectGroup {
             active_count,
             total_cost,
             avg_context_pct,
+            git: None,
+            urgency,
         }
     }
 }
@@ -3129,12 +3206,14 @@ impl App {
                     members.push(s);
                 }
             }
-            result.push(ProjectGroup::new(
+            let mut group = ProjectGroup::new(
                 proj.name.clone(),
                 Some(proj.path.clone()),
                 proj.has_git,
                 &members,
-            ));
+            );
+            group.git = self.git_cache.get(&proj.path).map(|(_, st)| st.clone());
+            result.push(group);
         }
 
         let orphans: Vec<&ClaudeSession> = sessions
@@ -3152,12 +3231,15 @@ impl App {
             ));
         }
 
-        // Projects hosting agents first (by cost desc), then idle projects by name.
+        // Projects hosting agents first, then by actionability (most-urgent agent
+        // — a NeedsInput beats a busy or merely expensive one), then cost desc,
+        // then name. Idle (zero-agent) projects sink below, ordered by name.
         result.sort_by(|a, b| {
             let a_active = a.session_count > 0;
             let b_active = b.session_count > 0;
             b_active
                 .cmp(&a_active)
+                .then_with(|| a.urgency.cmp(&b.urgency))
                 .then_with(|| {
                     b.total_cost
                         .partial_cmp(&a.total_cost)
@@ -3500,6 +3582,75 @@ mod tests {
         assert_eq!(groups[0].session_count, 1);
         assert_eq!(groups[1].name, "idle");
         assert_eq!(groups[1].session_count, 0);
+    }
+
+    #[test]
+    fn project_groups_sorts_by_actionability_over_cost() {
+        // Phase 3b: a blocked agent (NeedsInput) outranks a busy one (Processing)
+        // even when the busy project costs far more.
+        let mut app = App::new();
+        app.sessions = vec![
+            make_session(11, "busy", "opus", SessionStatus::Processing, 9.0, 10.0, true),
+            make_session(
+                12,
+                "blocked",
+                "sonnet",
+                SessionStatus::NeedsInput,
+                1.0,
+                10.0,
+                true,
+            ),
+        ];
+        app.projects = vec![
+            Project {
+                path: PathBuf::from("/tmp/busy"),
+                name: "busy".into(),
+                has_git: true,
+            },
+            Project {
+                path: PathBuf::from("/tmp/blocked"),
+                name: "blocked".into(),
+                has_git: true,
+            },
+        ];
+        let groups = app.project_groups();
+        assert_eq!(groups[0].name, "blocked", "NeedsInput should float to top");
+        assert_eq!(groups[1].name, "busy");
+    }
+
+    #[test]
+    fn project_groups_attaches_cached_git_status() {
+        // Phase 3b: project_groups() copies git status from the throttled cache.
+        let mut app = App::new();
+        let path = PathBuf::from("/tmp/repo");
+        app.projects = vec![Project {
+            path: path.clone(),
+            name: "repo".into(),
+            has_git: true,
+        }];
+        app.git_cache.insert(
+            path,
+            (
+                Instant::now(),
+                GitStatus {
+                    branch: "main".into(),
+                    dirty: true,
+                    ahead: 2,
+                    behind: 0,
+                    upstream: true,
+                    bare: false,
+                },
+            ),
+        );
+        let groups = app.project_groups();
+        let repo = groups.iter().find(|g| g.name == "repo").unwrap();
+        let git = repo
+            .git
+            .as_ref()
+            .expect("git status should propagate from cache");
+        assert_eq!(git.branch, "main");
+        assert!(git.dirty);
+        assert_eq!(git.ahead, 2);
     }
 
     #[test]

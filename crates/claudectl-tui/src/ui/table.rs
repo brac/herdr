@@ -210,8 +210,36 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     Style::default().fg(t.header).add_modifier(Modifier::BOLD)
                 };
+                // Phase 3 light path: append a git glance (branch · dirty ·
+                // ahead/behind) inline in the header. Colors come from the theme,
+                // so NO_COLOR (ThemeMode::None → Color::Reset) is respected (§6).
+                let mut header_spans = vec![Span::styled(header_text, header_style)];
+                if let Some(git) = &group.git {
+                    header_spans.push(Span::styled(
+                        format!("  {}", git.branch),
+                        Style::default().fg(t.text_muted),
+                    ));
+                    if !git.bare {
+                        if git.dirty {
+                            header_spans
+                                .push(Span::styled(" ●", Style::default().fg(t.status_waiting)));
+                        }
+                        if git.upstream && git.ahead > 0 {
+                            header_spans.push(Span::styled(
+                                format!(" ↑{}", git.ahead),
+                                Style::default().fg(t.status_unknown),
+                            ));
+                        }
+                        if git.upstream && git.behind > 0 {
+                            header_spans.push(Span::styled(
+                                format!(" ↓{}", git.behind),
+                                Style::default().fg(t.status_unknown),
+                            ));
+                        }
+                    }
+                }
                 let mut cells: Vec<Cell> =
-                    vec![Cell::from(""), Cell::from(header_text).style(header_style)];
+                    vec![Cell::from(""), Cell::from(Line::from(header_spans))];
                 for _ in 2..11 {
                     cells.push(Cell::from(""));
                 }

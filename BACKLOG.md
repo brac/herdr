@@ -22,10 +22,14 @@ I haven't even asked a question yet
 > prompt" half is **not** verified — needs a fresh repro; likely the first API call's system-prompt
 > tokens. See the `herdr-status` skill.
 
-## Feature: Better colors
+## Feature: Better colors - DONE
 The hightlight row color is too bright and hard to read. The colors are overall could use some work. 
 Build a theme system were we can slot in different colors for the UI. The default color should resemble that
 of Dracula Dark
+> Resolved: the Dark theme is now built from the Dracula palette (`DRAC_*` consts in `core/theme.rs`),
+> and the selected row uses a muted Dracula "current line" band (`selection_bg`/`selection_fg`) instead
+> of full-brightness reverse-video — the "too bright" complaint. The theme system was already slottable
+> (Dark/Light/None via `ThemeMode`); `None` keeps reverse-video for NO_COLOR. See `theme.rs` + `ui/table.rs`.
 
 ## Bug: Slow response on Status and Activity - DONE (Status); Activity open
 Both the Status and Activity readouts in herdr seem to lag behidn what is actually happening with the agent. Often times
@@ -35,9 +39,12 @@ consumotion or what is going on.
 > decay branch, so a finished agent leaves Processing within ~1–2 ticks (`fix:` 1e54cd7, `perf:` 8b191cd).
 > Still open: the **Activity sparkline** (`activity_history`) accuracy vs. real token throughput.
 
-## Bug: The $/hr is too small
+## Bug: The $/hr is too small - DONE
 I often see values of 6000/h or 4000/h. It seems to me that those should be the red values
-> Open. Cosmetic: threshold-color high burn (red). Pairs with "Bug: $/h is wild" below.
+> Resolved with "$/h is wild" below: those 6000/h readings were the bug, not real rates — a cost delta
+> divided by a hardcoded 2s tick during a sub-second event-loop burst. Now the rate is Δcost ÷ real
+> wall-clock, so magnitudes are sane and the existing `>10 → red` threshold in `ui/table.rs` colors a
+> genuinely hot agent red. Threshold coloring (low/mid/high) was already wired to the theme.
 
 ## Bug: Context should reset on /clear - DONE
 using /clear on an agent window should reflect in herdr that the context has been cleared
@@ -85,7 +92,29 @@ purple Need Input notice, but then it kept going. maybe becaues I was on auto mo
 > detection also tightened via the status work. Still open: a persistent at-a-glance roster indicator,
 > and the auto-mode "kept going" interaction the note describes.
 
-## Bug: $/h is wild
+## Bug: $/h is wild - DONE
 The nuimber is up and down and all over the palce. I feel like it should be the average of an hour? or er min?
-> Open. `burn_rate_per_hr` is an instantaneous per-tick delta (decays ×0.5) — volatile by construction.
-> A rolling average over a window would steady it. Documented in the `herdr-status` skill.
+> Resolved: burn rate is now Δcost ÷ Δ(real wall-clock), EMA-smoothed (`smooth_burn`, α=0.3), sampled
+> no faster than every 2s (`MIN_BURN_SAMPLE_MS`) — mirroring the CPU instantaneous-rate derivation. The
+> old `delta * 1800.0` assumed a fixed 2s tick, but the Phase-2.5 event loop fires at irregular,
+> sub-second intervals, so a JSONL burst spiked $/hr into the thousands and quiet ticks decayed it
+> erratically. New `prev_cost_sample_ms` field on the session carries the sample baseline. Tests:
+> `smooth_burn_steadies_a_spiky_signal`, `smooth_burn_decays_toward_zero_when_idle`. (`app.rs` refresh).
+
+## Feature: Model identification
+Each agetn should have a indicator about which model they are current running.
+
+## Bug: Reszing the window changes the agent window size permenantly
+When reszing the window smaller they resize properlly. When resize the window larger with both the roster and the agent window open, then the agent window stays the compressed size while herdr gets bigger. Upon getting larger the agent window should take more of the screen space when possible while still maintaiing the min-height for the roster
+
+## Bug: Roster selection bar should stay with last repo selected when launching an agent.
+Launhcing an agent in the roster view with n. The repo will sort to the top with the now active agent, leaving the roster selection on an unintended repo. The selection bar should follow the now sorted repo. 
+
+## Bug: Reoster bar is too small with only one or two active agents
+The roster bar should be a minimum for 12 rows when there are a small number of active agents. Ruight now there is one active agent and an open chat window and I see 7 rows. Header, Columns names, 2 repos, session overview and fleet bar.
+
+## Feature: Split waiting states
+If the agent is waiting for a repsonse from the API, the roster displays Waiting. The a task is complete the roster also dispalys Waiting. When a task is complete and the agent is waiting for the next task from the usr, then I want that task to be Job Done. So we can tell when we are waiting on the API and when we are waiting ont he user
+
+## Feature: Error Display 
+Somtimes we hit an API error. The Roster should display Error in the stats when this is encounted

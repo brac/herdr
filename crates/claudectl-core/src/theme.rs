@@ -1,5 +1,20 @@
 use ratatui::style::Color;
 
+// Dracula palette (https://draculatheme.com). The Dark theme is built from these
+// so colors stay coherent — and so the selected row uses a muted "current line"
+// fill instead of a glaring full-brightness reverse-video bar (BACKLOG: "the
+// highlight row color is too bright and hard to read").
+const DRAC_CURRENT_LINE: Color = Color::Rgb(68, 71, 90); // #44475a — selection fill
+const DRAC_FG: Color = Color::Rgb(248, 248, 242); // #f8f8f2 — foreground
+const DRAC_COMMENT: Color = Color::Rgb(98, 114, 164); // #6272a4 — muted / borders
+const DRAC_CYAN: Color = Color::Rgb(139, 233, 253); // #8be9fd
+const DRAC_GREEN: Color = Color::Rgb(80, 250, 123); // #50fa7b
+const DRAC_ORANGE: Color = Color::Rgb(255, 184, 108); // #ffb86c
+const DRAC_PINK: Color = Color::Rgb(255, 121, 198); // #ff79c6
+const DRAC_PURPLE: Color = Color::Rgb(189, 147, 249); // #bd93f9
+const DRAC_RED: Color = Color::Rgb(255, 85, 85); // #ff5555
+const DRAC_YELLOW: Color = Color::Rgb(241, 250, 140); // #f1fa8c
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeMode {
     Dark,
@@ -50,6 +65,11 @@ pub struct Theme {
     pub highlight_key: Color,
     pub text_primary: Color,
     pub text_muted: Color,
+    /// Selected-row fill + text. Replaces reverse-video so the highlight is a
+    /// calm band rather than a full-brightness inversion (`None` mode leaves
+    /// these `Reset` and the table falls back to reverse-video).
+    pub selection_bg: Color,
+    pub selection_fg: Color,
 
     // Data colors
     pub cost: Color,
@@ -76,34 +96,38 @@ impl Theme {
         }
     }
 
+    /// Dracula-flavored dark theme (BACKLOG: "default color should resemble
+    /// Dracula Dark"). Built from the `DRAC_*` palette so accents stay coherent.
     fn dark() -> Self {
         Self {
             mode: ThemeMode::Dark,
-            status_needs_input: Color::Magenta,
-            status_processing: Color::Green,
-            status_waiting: Color::Yellow,
-            status_unknown: Color::Blue,
-            status_idle: Color::DarkGray,
-            status_finished: Color::Red,
-            border: Color::DarkGray,
-            header: Color::Cyan,
-            footer: Color::DarkGray,
-            highlight_key: Color::Yellow,
-            text_primary: Color::White,
-            text_muted: Color::DarkGray,
-            cost: Color::Yellow,
-            cost_warning: Color::LightRed,
-            cost_danger: Color::Red,
-            context_ok: Color::Green,
-            context_warning: Color::Yellow,
-            context_danger: Color::Red,
-            burn_rate_low: Color::DarkGray,
-            burn_rate_mid: Color::Yellow,
-            burn_rate_high: Color::Red,
-            sparkline: Color::Blue,
-            input_accent: Color::Cyan,
-            success: Color::Green,
-            error: Color::Red,
+            status_needs_input: DRAC_PURPLE, // the "purple Need Input" notice
+            status_processing: DRAC_GREEN,
+            status_waiting: DRAC_YELLOW,
+            status_unknown: DRAC_COMMENT,
+            status_idle: DRAC_COMMENT,
+            status_finished: DRAC_RED,
+            border: DRAC_CURRENT_LINE,
+            header: DRAC_CYAN,
+            footer: DRAC_COMMENT,
+            highlight_key: DRAC_ORANGE,
+            text_primary: DRAC_FG,
+            text_muted: DRAC_COMMENT,
+            cost: DRAC_YELLOW,
+            cost_warning: DRAC_ORANGE,
+            cost_danger: DRAC_RED,
+            context_ok: DRAC_GREEN,
+            context_warning: DRAC_YELLOW,
+            context_danger: DRAC_RED,
+            burn_rate_low: DRAC_COMMENT,
+            burn_rate_mid: DRAC_ORANGE,
+            burn_rate_high: DRAC_RED,
+            sparkline: DRAC_CYAN,
+            input_accent: DRAC_PINK,
+            success: DRAC_GREEN,
+            error: DRAC_RED,
+            selection_bg: DRAC_CURRENT_LINE,
+            selection_fg: DRAC_FG,
         }
     }
 
@@ -135,6 +159,8 @@ impl Theme {
             input_accent: Color::Blue,
             success: Color::Blue,
             error: Color::Red,
+            selection_bg: Color::Rgb(208, 208, 216), // soft gray band
+            selection_fg: Color::Black,
         }
     }
 
@@ -167,6 +193,8 @@ impl Theme {
             input_accent: Color::Reset,
             success: Color::Reset,
             error: Color::Reset,
+            selection_bg: Color::Reset,
+            selection_fg: Color::Reset,
         }
     }
 

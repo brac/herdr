@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::app::{App, RosterRow, SORT_COLUMNS};
 use claudectl_core::session::{ClaudeSession, SessionStatus, SubagentBreakdown, SubagentState};
+use claudectl_core::theme::ThemeMode;
 
 use super::detail::render_detail_panel;
 use super::help::render_help_overlay;
@@ -440,14 +441,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border));
 
+    // A calm "current line" band (Dracula) instead of full-brightness reverse
+    // video, which read as glaring (BACKLOG: "highlight row too bright"). Under
+    // NO_COLOR (`None` mode) fall back to reverse-video — the only colorless way
+    // to show selection besides the ▶ symbol.
+    let highlight_style = if t.mode == ThemeMode::None {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+            .bg(t.selection_bg)
+            .fg(t.selection_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
-        .row_highlight_style(
-            Style::default()
-                .add_modifier(Modifier::REVERSED)
-                .fg(t.text_primary),
-        )
+        .row_highlight_style(highlight_style)
         .highlight_symbol("\u{25b6} "); // ▶
 
     // ratatui 0.30 made TableState `Copy`, so copy it out rather than clone.

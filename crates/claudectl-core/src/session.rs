@@ -128,7 +128,14 @@ pub struct ClaudeSession {
     pub cost_usd: f64,
     pub context_tokens: u64,
     pub context_max: u64,
+    /// Cost (USD) at the previous *burn-rate sample* (not the previous refresh).
+    /// Burn rate is Δcost ÷ Δwall-clock; this is the baseline that delta is
+    /// measured from, updated only when a sample is actually taken.
     pub prev_cost_usd: f64,
+    /// Wall-clock (ms since epoch) when `prev_cost_usd` was sampled. Mirrors the
+    /// CPU sampling state so burn rate is derived from real elapsed time, not an
+    /// assumed fixed tick (the event-driven loop fires at irregular intervals).
+    pub prev_cost_sample_ms: u64,
     pub burn_rate_per_hr: f64,
     pub subagent_count: usize,
     pub active_subagent_count: usize,
@@ -366,6 +373,7 @@ impl ClaudeSession {
             context_tokens: 0,
             context_max: 0,
             prev_cost_usd: 0.0,
+            prev_cost_sample_ms: 0,
             burn_rate_per_hr: 0.0,
             subagent_count: 0,
             active_subagent_count: 0,

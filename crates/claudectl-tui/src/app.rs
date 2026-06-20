@@ -31,6 +31,22 @@ pub const FLEET_HISTORY_CAP: usize = 40;
 /// bunch up the trend's time axis (sample at roughly the safety-net tick rate).
 const FLEET_SAMPLE_MIN_MS: u64 = 1_800;
 
+/// Skip per-agent burn-rate samples taken over a window shorter than this. The
+/// Phase-2.5 event loop can refresh sub-second during a JSONL burst; dividing a
+/// cost delta by a near-zero interval is what sent $/hr to absurd spikes
+/// ("6000/h"). Wait for a meaningful window before recomputing the rate.
+const MIN_BURN_SAMPLE_MS: u64 = 2_000;
+/// EMA weight for the new burn sample. Low → steady trailing average rather than
+/// a per-tick reading, which is what made $/hr jump "all over the place".
+const BURN_EMA_ALPHA: f64 = 0.3;
+
+/// Gentle symmetric EMA so $/hr reads as a smoothed trailing average. Used both
+/// on the way up and down, so a finished agent's rate eases to zero instead of
+/// snapping (the decay also clears it once it falls below the display floor).
+fn smooth_burn(prev: f64, sample: f64) -> f64 {
+    prev + BURN_EMA_ALPHA * (sample - prev)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusFilter {
     All,
@@ -904,11 +920,6 @@ impl App {
         // Resolve git worktree identity (for conflict detection, runs once per session)
         discovery::resolve_worktree_ids(&mut sessions);
 
-        // Snapshot previous cost for burn rate BEFORE reading new JSONL data
-        for session in &mut sessions {
-            session.prev_cost_usd = session.cost_usd;
-        }
-
         // Read JSONL incrementally (only new bytes since last offset). A session
         // whose offset advanced had real transcript activity this refresh — its
         // working tree likely changed, so re-fetch that project's git status
@@ -925,20 +936,38 @@ impl App {
         let jsonl_elapsed = jsonl_start.elapsed();
         self.enqueue_git_for_cwds(&active_cwds);
 
-        // Compute burn rate from cost delta (skip first tick where prev_cost is 0)
+        // Burn rate = Δcost ÷ Δwall-clock, EMA-smoothed. The event-driven loop
+        // (Phase 2.5) refreshes at irregular, sometimes sub-second intervals, so
+        // the old `delta * 1800` (a hardcoded 2s tick) spiked $/hr into the
+        // thousands on a JSONL burst and decayed it erratically on quiet ticks
+        // (BACKLOG: "$/h is wild" / "$/hr too small"). Mirror the CPU derivation:
+        // seed the baseline on first sight, skip windows too short to be
+        // meaningful, divide by real elapsed time, and smooth the result.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         for session in &mut sessions {
-            if session.prev_cost_usd > 0.001 {
-                let delta = session.cost_usd - session.prev_cost_usd;
-                if delta > 0.001 {
-                    session.burn_rate_per_hr = delta * 1800.0;
-                } else {
-                    // Decay burn rate toward zero when no new cost
-                    session.burn_rate_per_hr *= 0.5;
-                    if session.burn_rate_per_hr < 0.01 {
-                        session.burn_rate_per_hr = 0.0;
-                    }
-                }
+            if session.prev_cost_sample_ms == 0 {
+                // First sample for this session: record the baseline, no rate yet.
+                session.prev_cost_usd = session.cost_usd;
+                session.prev_cost_sample_ms = now_ms;
+                continue;
             }
+            let elapsed_ms = now_ms.saturating_sub(session.prev_cost_sample_ms);
+            if elapsed_ms < MIN_BURN_SAMPLE_MS {
+                // Window too short — let cost/clock accumulate for the next tick,
+                // keeping the prior smoothed rate on display.
+                continue;
+            }
+            let delta = (session.cost_usd - session.prev_cost_usd).max(0.0);
+            let inst = delta / (elapsed_ms as f64 / 1000.0) * 3600.0;
+            session.burn_rate_per_hr = smooth_burn(session.burn_rate_per_hr, inst);
+            if session.burn_rate_per_hr < 0.01 {
+                session.burn_rate_per_hr = 0.0;
+            }
+            session.prev_cost_usd = session.cost_usd;
+            session.prev_cost_sample_ms = now_ms;
         }
 
         // Budget enforcement
@@ -4243,6 +4272,30 @@ mod tests {
         assert_eq!(merged.jsonl_offset, 999);
         assert_eq!(merged.started_at, 5, "ephemeral fields refresh");
         assert_eq!(merged.elapsed, std::time::Duration::from_secs(42));
+    }
+
+    #[test]
+    fn smooth_burn_steadies_a_spiky_signal() {
+        // BACKLOG "$/h is wild": a single high reading must not snap the display
+        // to it — the EMA eases toward the sample, so one spike barely moves it.
+        let after_spike = smooth_burn(2.0, 100.0);
+        assert!(after_spike < 32.0, "one spike must not dominate, got {after_spike}");
+        // Repeated equal samples converge toward the true rate.
+        let mut r = 0.0;
+        for _ in 0..40 {
+            r = smooth_burn(r, 5.0);
+        }
+        assert!((r - 5.0).abs() < 0.1, "should converge to the sustained rate, got {r}");
+    }
+
+    #[test]
+    fn smooth_burn_decays_toward_zero_when_idle() {
+        // A finished agent (sample 0.0) eases down rather than holding its rate.
+        let mut r = 50.0;
+        for _ in 0..30 {
+            r = smooth_burn(r, 0.0);
+        }
+        assert!(r < 0.01, "idle rate should decay to ~zero, got {r}");
     }
 
     fn make_test_app() -> App {

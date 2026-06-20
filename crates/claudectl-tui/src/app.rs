@@ -3156,6 +3156,8 @@ impl App {
             Ok((target, path)) => {
                 // In tmux, `target` is the new pane id — track it as the stage.
                 if in_tmux {
+                    let title = stage_title_for(&path);
+                    terminals::set_stage_title(&target, &title);
                     self.staged_pane = Some(target);
                     let _ = terminals::resize_stage_top(self.stage_top_rows());
                 }
@@ -3167,9 +3169,26 @@ impl App {
 
     /// Swap the bottom split "stage" to show the selected agent's pane (one at a
     /// time). Pressing `o` on the already-staged agent hides it. tmux only.
+    /// Re-fit herdr's own pane to its roster height when an agent is staged below.
+    /// Called on terminal resize so *growing* the window hands the freed rows back
+    /// to the staged agent instead of leaving it compressed at the old size
+    /// (BACKLOG "resizing the window changes the agent window size permanently").
+    /// Gated on "staged" so it never fights a manual `Ctrl-b` resize when nothing
+    /// is staged below herdr.
+    pub fn refit_stage(&self) {
+        if self.staged_pane.is_some() {
+            let _ = terminals::resize_stage_top(self.stage_top_rows());
+        }
+    }
+
     fn stage_selected(&mut self) {
-        let (pid, tty, remote) = match self.selected_session() {
-            Some(s) => (s.pid, s.tty.clone(), s.is_remote()),
+        let (pid, tty, remote, name) = match self.selected_session() {
+            Some(s) => (
+                s.pid,
+                s.tty.clone(),
+                s.is_remote(),
+                s.display_name().to_string(),
+            ),
             None => {
                 self.status_msg = "Select an agent to view in the split".into();
                 return;
@@ -3188,6 +3207,7 @@ impl App {
         // Toggle off if this agent is already the staged one.
         if self.staged_pane.as_deref() == Some(pane.as_str()) {
             let _ = terminals::unstage_pane(&pane);
+            terminals::clear_stage_title();
             self.staged_pane = None;
             self.status_msg = "Hid the agent pane".into();
             return;
@@ -3196,6 +3216,7 @@ impl App {
         let previous = self.staged_pane.take();
         match terminals::stage_pane(&pane, previous.as_deref()) {
             Ok(()) => {
+                terminals::set_stage_title(&pane, &format!("Claude \u{2014} {name}"));
                 self.staged_pane = Some(pane);
                 let _ = terminals::resize_stage_top(self.stage_top_rows());
                 self.status_msg = "Viewing agent (Ctrl-b ↓ to type · o to hide)".into();
@@ -3242,6 +3263,8 @@ impl App {
                 self.launch_mode = false;
                 self.launch_form = LaunchForm::default();
                 if in_tmux {
+                    let title = stage_title_for(&request.cwd_path.display().to_string());
+                    terminals::set_stage_title(&target, &title);
                     self.staged_pane = Some(target);
                     let _ = terminals::resize_stage_top(self.stage_top_rows());
                 }
@@ -3929,6 +3952,18 @@ fn merge_discovered_session(prev: ClaudeSession, new: ClaudeSession) -> ClaudeSe
 
 /// Actionability rank for roster ordering (from agent-deck): a blocked agent is
 /// more urgent than a busy or expensive one. Lower sorts first.
+/// Title for a freshly launched agent's staged pane border: "Claude — <project>"
+/// from the launch path's final component.
+fn stage_title_for(path: &str) -> String {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("agent");
+    format!("Claude \u{2014} {name}")
+}
+
 fn status_urgency(status: SessionStatus) -> u8 {
     match status {
         SessionStatus::NeedsInput => 0,
@@ -4453,6 +4488,13 @@ mod tests {
         // Clamps to the last roster row — the surviving agent, not its header.
         assert_eq!(app.table_state.selected(), Some(1));
         assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
+    }
+
+    #[test]
+    fn stage_title_uses_the_path_basename() {
+        assert_eq!(stage_title_for("/mnt/c/Work/herdr"), "Claude \u{2014} herdr");
+        assert_eq!(stage_title_for("/mnt/c/Work/herdr/"), "Claude \u{2014} herdr");
+        assert_eq!(stage_title_for(""), "Claude \u{2014} agent");
     }
 
     #[test]

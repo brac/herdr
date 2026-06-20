@@ -98,6 +98,41 @@ pub fn join_into_herdr(pane: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Title the staged agent's pane and turn on titled pane borders, so the divider
+/// under herdr reads like herdr's own `-herdr-` (BACKLOG "Claude window border").
+/// Window-scoped tmux options targeting herdr's window — pure composition (§0.1),
+/// best-effort. The agent is the bottom pane, so its top-edge border (the divider)
+/// carries the title; herdr's pane is labelled "herdr" to match.
+pub fn set_stage_border(agent_pane: &str, title: &str) {
+    let Ok(herdr) = std::env::var("TMUX_PANE") else {
+        return;
+    };
+    let run = |args: &[&str]| {
+        let _ = std::process::Command::new("tmux").args(args).output();
+    };
+    run(&["select-pane", "-t", agent_pane, "-T", title]);
+    run(&["select-pane", "-t", &herdr, "-T", "herdr"]);
+    run(&["set-option", "-w", "-t", &herdr, "pane-border-status", "top"]);
+    run(&[
+        "set-option",
+        "-w",
+        "-t",
+        &herdr,
+        "pane-border-format",
+        " #{pane_title} ",
+    ]);
+}
+
+/// Turn titled pane borders back off (nothing staged). Best-effort.
+pub fn clear_stage_border() {
+    let Ok(herdr) = std::env::var("TMUX_PANE") else {
+        return;
+    };
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-w", "-t", &herdr, "pane-border-status", "off"])
+        .output();
+}
+
 /// Break `pane` out of herdr's window back to its own background window, so it's
 /// preserved but no longer visible (only one agent staged at a time).
 pub fn break_out(pane: &str) -> Result<(), String> {

@@ -183,7 +183,13 @@ fn run<W: io::Write>(
                     }
                     needs_redraw = true;
                 }
-                // Resize/mouse/etc. — repaint so the new geometry takes effect.
+                // Terminal resized: re-fit herdr's pane so a staged agent reclaims
+                // the freed rows instead of staying compressed (BACKLOG resize bug).
+                Event::Resize(_, _) => {
+                    app.refit_stage();
+                    needs_redraw = true;
+                }
+                // Other events (mouse/paste/focus) — repaint so geometry takes effect.
                 _ => needs_redraw = true,
             }
         }

@@ -57,9 +57,14 @@ using /clear on an agent window should reflect in herdr that the context has bee
 > Resolved before this session: `fix:` e048a41 (attribute transcripts by session id; reset context
 > on /clear) + test `merge_resets_transcript_state_when_session_id_changes`.
 
-## Feature: Claude window border
+## Feature: Claude window border - DONE
 Can tmux add a border to the claude window just as herdr has it's own window title and border ie 
 -herdr-----
+> Resolved by composing tmux (no rendering, §0.1): when an agent is staged, herdr sets
+> `pane-border-status top` + a `#{pane_title}` border-format on its window and titles the agent pane
+> "Claude — <project>" (and its own "herdr"). The agent's top-edge border is the divider under herdr,
+> so it reads like `-herdr-`. Cleared (`pane-border-status off`) when the stage is hidden.
+> `terminals::set_stage_title`/`clear_stage_title` → `tmux::set_stage_border`.
 
 ## Feature: Persistent cost - DONE
 A value that reflects the cost over multiple (all) sessions. For the repo collection as a whole and individual projects. 
@@ -77,12 +82,20 @@ cargo run --release -- "/mnt/c/Users/Ben Bracamonte/Work"
 > reuses a tmux session (default `work`, override `HERDR_SESSION`) with herdr running over PARENT_DIR
 > (defaults to the repo's parent dir; handles paths with spaces). Switches client if already in tmux.
 
-## Feature: Add Mouse Scrolling
+## Feature: Add Mouse Scrolling - DONE (tmux-native)
 set -g mouse on
 Mouse scroll works on roster page but in agent window it scrolls the messages i eneted. Can we make the scroll wheel scroll the responses like a normal agent window
+> Resolved the tmux-native way: `quickstart.sh` now runs `tmux set -g mouse on`, so wheel-scroll over
+> the staged agent pane enters tmux copy-mode and scrolls its responses. herdr deliberately does **not**
+> call crossterm `EnableMouseCapture` — that would fight tmux's mouse handling in herdr's pane and lose
+> native text selection (§0.1, tmux owns window management). Add `set -g mouse on` to `~/.tmux.conf` to
+> make it permanent.
 
-## Feature: Mouse Focus
+## Feature: Mouse Focus - DONE (tmux-native)
 Is this possible without betraying our design doc? I want to be able to click between the herdr window and the chat window
+> Yes, without betraying the doc: it's tmux's `set -g mouse on` (now set by `quickstart.sh`) — click a
+> pane to focus it. herdr stays out of mouse capture so tmux owns click-to-focus, fully aligned with
+> §0.1. Pairs with "Add Mouse Scrolling" above.
 
 ## Features: Charts - DONE (v1)
 What kind of charts would be informative that we could display along side ond beneath the herdr nav bar?
@@ -121,8 +134,13 @@ Each agetn should have a indicator about which model they are current running.
 > shortened by `models::shorten_model`). Per user decision, deliberately **not** added as a roster
 > column to keep the row uncluttered.
 
-## Bug: Reszing the window changes the agent window size permenantly
+## Bug: Reszing the window changes the agent window size permenantly - DONE
 When reszing the window smaller they resize properlly. When resize the window larger with both the roster and the agent window open, then the agent window stays the compressed size while herdr gets bigger. Upon getting larger the agent window should take more of the screen space when possible while still maintaiing the min-height for the roster
+> Resolved: `Event::Resize` only repainted — `resize_stage_top` was never re-issued, so tmux kept the
+> old height and a grown window left the agent pane compressed. The event loop now calls
+> `App::refit_stage()` on resize, which re-fits herdr to its roster height (capped to preserve the
+> agent's min) when an agent is staged. Gated on "staged" so it never fights a manual `Ctrl-b` resize.
+> (`src/main.rs`, `app.rs`.)
 
 ## Bug: Roster selection bar should stay with last repo selected when launching an agent. - DONE
 Launhcing an agent in the roster view with n. The repo will sort to the top with the now active agent, leaving the roster selection on an unintended repo. The selection bar should follow the now sorted repo. 

@@ -3,6 +3,15 @@
 Concrete URLs for the references named in `CLAUDE.md` and `PROJECT_OVERVIEW.md`.
 Verify these resolve before the planning session relies on them; some are GitHub repos that may move.
 
+## Comparable tools (cloned adjacent under `../`, analyzed in `docs/COMPARABLES.md`)
+- claudectl (`../claudectl`): https://github.com/mercurialsolo/claudectl — the Rust base herdr forked
+- agent-deck (`../agent-deck`): https://github.com/slima4/agent-deck — Go multi-agent tmux session manager
+- claude-tui (`../claude-tui`): https://github.com/slima4/claude-tui — Python statusline/monitor/analytics/hooks
+- ccusage (`../ccusage`): https://github.com/ccusage/ccusage — Rust cost engine (closest cost comp)
+- Claude-Code-Usage-Monitor (`../Claude-Code-Usage-Monitor`): https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor — predictions/warnings
+- tokscale (`../tokscale`): https://github.com/junhoyeo/tokscale — MIT Rust multi-tool usage + heatmap
+- vscode-claude-status (`../vscode-claude-status`): https://github.com/long-910/vscode-claude-status — TS status-bar meter
+
 ## Primary
 - claudectl repo: https://github.com/mercurialsolo/claudectl
 - claudectl architecture writeup: https://mercurialsolo.github.io/posts/claudectl-tui-dashboard/

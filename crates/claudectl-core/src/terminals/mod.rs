@@ -1048,6 +1048,21 @@ pub fn resize_stage_top(rows: u16) -> Result<(), String> {
     }
 }
 
+/// Give the staged agent pane a titled tmux border (BACKLOG "Claude window
+/// border"). No-op outside tmux.
+pub fn set_stage_title(agent_pane: &str, title: &str) {
+    if matches!(detect_terminal(), Terminal::Tmux) {
+        tmux::set_stage_border(agent_pane, title);
+    }
+}
+
+/// Remove the staged-pane titled border (nothing staged). No-op outside tmux.
+pub fn clear_stage_title() {
+    if matches!(detect_terminal(), Terminal::Tmux) {
+        tmux::clear_stage_border();
+    }
+}
+
 /// Hide a staged pane (break it back out to its own window). No-op outside tmux.
 pub fn unstage_pane(pane: &str) -> Result<(), String> {
     if matches!(detect_terminal(), Terminal::Tmux) {

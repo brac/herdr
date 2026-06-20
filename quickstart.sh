@@ -40,6 +40,13 @@ else
   tmux new-session -d -s "$SESSION" -n herdr -c "$PARENT_DIR" "'$BIN' '$PARENT_DIR'"
 fi
 
+# Mouse on: lets tmux own click-to-focus between herdr and the staged agent pane,
+# and wheel-scroll the agent's responses in copy-mode — herdr deliberately does
+# NOT capture the mouse itself (tmux owns window management, CLAUDE.md §0.1), so
+# this is the supported way to get mouse scroll + focus. Add the same line to your
+# ~/.tmux.conf to make it permanent across sessions herdr didn't create.
+tmux set -g mouse on
+
 # Attach (or switch, if we're already inside tmux).
 if [ -n "${TMUX:-}" ]; then
   tmux switch-client -t "$SESSION"

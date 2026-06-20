@@ -123,6 +123,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("  Toggle grouped view by project"),
         ]),
         Line::from(vec![
+            Span::styled("  G              ", Style::default().fg(t.highlight_key)),
+            Span::raw("  Toggle the fleet trend strip (status counts + burn sparkline + today/week cost)"),
+        ]),
+        Line::from(vec![
             Span::styled("  p              ", Style::default().fg(t.highlight_key)),
             Span::raw("  Toggle peers panel (relay feature)"),
         ]),

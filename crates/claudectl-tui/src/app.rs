@@ -23,6 +23,14 @@ use claudectl_core::theme::Theme;
 
 pub const SORT_COLUMNS: &[&str] = &["Status", "Context", "Cost", "$/hr", "Elapsed"];
 
+/// Phase 5: how many fleet-burn samples the trend sparkline keeps. At ~2s/sample
+/// that's ~80s of recent history — enough to read the fleet's spend trajectory
+/// without holding unbounded data.
+pub const FLEET_HISTORY_CAP: usize = 40;
+/// Minimum spacing between fleet-burn samples, so event-driven refreshes don't
+/// bunch up the trend's time axis (sample at roughly the safety-net tick rate).
+const FLEET_SAMPLE_MIN_MS: u64 = 1_800;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusFilter {
     All,
@@ -341,6 +349,19 @@ impl ApprovalAct {
     }
 }
 
+/// Phase 5 fleet roll-up for the trend strip: per-status agent counts plus the
+/// summed live burn. A single glance at the whole fleet, which the per-row roster
+/// can't give without scanning every line.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FleetCounts {
+    pub needs_input: usize,
+    pub processing: usize,
+    pub waiting: usize,
+    pub idle: usize,
+    pub total: usize,
+    pub burn_per_hr: f64,
+}
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -394,6 +415,13 @@ pub struct App {
     pub debug_timings: DebugTimings,
     pub grouped_view: bool,
     pub detail_panel: bool, // Show expanded detail for selected session
+    /// Phase 5: show the fleet trend strip beneath the roster (toggle with `G`).
+    pub show_fleet: bool,
+    /// Rolling samples of total fleet burn ($/hr summed across agents), newest
+    /// last. Drives the trend sparkline — the time axis no single roster row has.
+    pub fleet_burn_history: Vec<f64>,
+    /// Wall-clock (ms) of the last fleet-burn sample; gates the sample cadence.
+    last_fleet_sample_ms: u64,
     pub webhook_url: Option<String>,
     pub webhook_filter: Option<Vec<String>>, // Only fire on these status names
     pub launch_mode: bool,                   // Capturing launch wizard fields
@@ -706,6 +734,9 @@ impl App {
             debug_timings: DebugTimings::default(),
             grouped_view: true,
             detail_panel: false,
+            show_fleet: true,
+            fleet_burn_history: Vec::new(),
+            last_fleet_sample_ms: 0,
             webhook_url: None,
             webhook_filter: None,
             launch_mode: false,
@@ -1684,6 +1715,19 @@ impl App {
         }
 
         self.refresh();
+
+        // Phase 5: sample total fleet burn for the trend sparkline. Gated so a
+        // burst of event-driven ticks doesn't compress the trend's time axis;
+        // burn_rate_per_hr was just recomputed by refresh().
+        if now_ms.saturating_sub(self.last_fleet_sample_ms) >= FLEET_SAMPLE_MIN_MS {
+            let total: f64 = self.sessions.iter().map(|s| s.burn_rate_per_hr).sum();
+            self.fleet_burn_history.push(total);
+            if self.fleet_burn_history.len() > FLEET_HISTORY_CAP {
+                self.fleet_burn_history.remove(0);
+            }
+            self.last_fleet_sample_ms = now_ms;
+        }
+
         self.run_auto_actions();
 
         // Check idle mode transition
@@ -2963,6 +3007,16 @@ impl App {
                 self.cancel_pending_auto_approve();
                 self.open_chat();
             }
+            (KeyCode::Char('G'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.show_fleet = !self.show_fleet;
+                self.status_msg = if self.show_fleet {
+                    "Fleet trend strip on".into()
+                } else {
+                    "Fleet trend strip off".into()
+                };
+            }
             (KeyCode::Char('g'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
@@ -3231,6 +3285,25 @@ impl App {
 
     pub fn visible_session_count(&self) -> usize {
         self.visible_session_indices().len()
+    }
+
+    /// Phase 5: roll the live fleet up by status + total burn for the trend strip.
+    /// Counts every agent (not just filtered rows) — the strip is a whole-fleet
+    /// glance, independent of the roster's active triage filters.
+    pub fn fleet_counts(&self) -> FleetCounts {
+        let mut c = FleetCounts::default();
+        for s in &self.sessions {
+            c.total += 1;
+            c.burn_per_hr += s.burn_rate_per_hr;
+            match s.status {
+                SessionStatus::NeedsInput => c.needs_input += 1,
+                SessionStatus::Processing => c.processing += 1,
+                SessionStatus::WaitingInput => c.waiting += 1,
+                // Idle/Unknown/Finished all read as "not currently engaged".
+                _ => c.idle += 1,
+            }
+        }
+        c
     }
 
     fn normalize_selection(&mut self) {
@@ -3950,7 +4023,10 @@ impl App {
                 }
             })
             .sum();
-        ((visual + 4) as u16).clamp(6, 40)
+        // +1 for the fleet trend strip when it's shown, so the staged pane below
+        // reserves room for it too (auto-height, BACKLOG).
+        let fleet = usize::from(self.show_fleet);
+        ((visual + 4 + fleet) as u16).clamp(6, 40)
     }
 
     /// Working directory to launch a new agent into, derived from the current
@@ -4316,8 +4392,10 @@ mod tests {
         // BACKLOG auto-height: an idle, agent-less project header must NOT reserve
         // pane height. make_grouped_app has one active project ("alpha", agent 11)
         // and one idle project ("idle"). Only alpha's header + its one agent count:
-        // 1 header + 1 agent + 4 chrome = 6 (which is also the floor).
-        let app = make_grouped_app();
+        // 1 header + 1 agent + 4 chrome = 6 (which is also the floor). Disable the
+        // fleet strip so this exercises idle-project handling, not the +1 strip row.
+        let mut app = make_grouped_app();
+        app.show_fleet = false;
         assert_eq!(app.stage_top_rows(), 6);
 
         // Adding more idle projects must not grow the pane — only agent-bearing
@@ -4661,6 +4739,45 @@ mod tests {
         assert_eq!(ApprovalAct::Approve.past_tense(), "Approved");
         assert_eq!(ApprovalAct::Deny.past_tense(), "Denied");
         assert_eq!(ApprovalAct::Interrupt.past_tense(), "Interrupted");
+    }
+
+    // ---- Phase 5: fleet trend strip --------------------------------------------
+
+    #[test]
+    fn fleet_counts_rolls_status_and_burn() {
+        let mut app = App::new();
+        let mut a = make_session(1, "a", "opus", SessionStatus::NeedsInput, 0.0, 0.0, true);
+        a.burn_rate_per_hr = 1.5;
+        let mut b = make_session(2, "b", "opus", SessionStatus::Processing, 0.0, 0.0, true);
+        b.burn_rate_per_hr = 2.0;
+        let c = make_session(3, "c", "opus", SessionStatus::WaitingInput, 0.0, 0.0, true);
+        let d = make_session(4, "d", "opus", SessionStatus::Idle, 0.0, 0.0, true);
+        app.sessions = vec![a, b, c, d];
+
+        let f = app.fleet_counts();
+        assert_eq!(f.total, 4);
+        assert_eq!(f.needs_input, 1);
+        assert_eq!(f.processing, 1);
+        assert_eq!(f.waiting, 1);
+        assert_eq!(f.idle, 1);
+        assert!((f.burn_per_hr - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fleet_counts_is_empty_for_no_agents() {
+        let mut app = App::new();
+        app.sessions = Vec::new(); // App::new() may discover live sessions on the dev box
+        assert_eq!(app.fleet_counts(), FleetCounts::default());
+    }
+
+    #[test]
+    fn toggling_fleet_strip_flips_the_flag() {
+        let mut app = App::new();
+        assert!(app.show_fleet, "fleet strip defaults on");
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert!(!app.show_fleet);
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert!(app.show_fleet);
     }
 
     #[test]

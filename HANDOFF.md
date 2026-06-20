@@ -49,9 +49,23 @@ lets you approve in-pane, so the value is approving *without switching panes*).
   the first tmux pane (`pane_tty.contains("")` is always true) — same in `send_input`. Real agents
   have a tty, so it doesn't bite in practice; worth tightening if it ever does.
 
+## Phase 5 — as built (fleet trend strip, v1)
+
+The roster already covers per-agent *now* (Context bar + Activity sparkline columns),
+so charts that re-display per-row values are redundant. Phase 5 v1 adds the one thing
+a row can't: the **fleet over time + cross-session history**.
+- One-line **fleet strip** beneath the roster (`ui/fleet.rs`), toggle **`G`** (default on):
+  status counts (needs/proc/wait/idle), live total **burn $/hr + a trend sparkline**
+  (`App.fleet_burn_history`, sampled in `tick()` at ~2s spacing, cap 40), and today/week
+  cost from the existing `history::weekly_summary`.
+- `App::fleet_counts() -> FleetCounts` rolls the whole fleet up (ignores triage filters).
+- `stage_top_rows()` reserves +1 when the strip is shown (auto-height).
+- Not yet built: per-metric chart picker, a dedicated full graphs screen, daily cost
+  BarChart (would need bucketing `history::load_history` by day — scalars only today).
+
 ## Not done / next candidates
 
-1. **Phase 5 — graphs** (sparklines/gauges) once we know which numbers earn a permanent spot.
+1. **Phase 5 cont.** — daily cost BarChart, or a dedicated graphs overlay, if the strip earns it.
 2. **Dynamic stage auto-height** — currently re-fits only on stage/launch (so it never fights a manual
    `Ctrl-b` resize). User was offered a "re-fit on refresh with change-detection" variant; not built.
 3. **Excise dormant residuals** — the inert `MockRuntime`/`rules`/`Orchestrator` bits (see map's

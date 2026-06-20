@@ -4,6 +4,7 @@
 pub mod approval;
 pub mod chat;
 pub mod detail;
+pub mod fleet;
 pub mod help;
 #[cfg(feature = "relay")]
 pub mod peers;

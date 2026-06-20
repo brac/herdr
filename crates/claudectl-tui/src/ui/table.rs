@@ -22,6 +22,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         || app.search_mode
         || app.has_active_filters();
     let show_detail = app.detail_panel && app.selected_session().is_some();
+    // Phase 5: the fleet trend strip is a whole-fleet glance — show it whenever
+    // there are agents to summarize (no agents → nothing to trend).
+    let show_fleet_strip = app.show_fleet && !app.sessions.is_empty();
 
     let mut constraints = Vec::new();
     if show_detail {
@@ -29,6 +32,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         constraints.push(Constraint::Percentage(45)); // detail
     } else {
         constraints.push(Constraint::Min(3));
+    }
+    if show_fleet_strip {
+        constraints.push(Constraint::Length(1));
     }
     if has_status {
         constraints.push(Constraint::Length(1));
@@ -455,6 +461,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         if let Some(session) = app.selected_session() {
             render_detail_panel(frame, chunks[next_chunk], session, app);
         }
+        next_chunk += 1;
+    }
+
+    // Fleet trend strip (Phase 5) — between the roster and the status bar.
+    if show_fleet_strip && next_chunk < chunks.len() {
+        super::fleet::render_fleet_strip(frame, chunks[next_chunk], app);
         next_chunk += 1;
     }
 

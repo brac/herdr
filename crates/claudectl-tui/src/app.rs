@@ -805,12 +805,8 @@ impl App {
         let mut sessions: Vec<ClaudeSession> = discovered
             .into_iter()
             .map(|new| {
-                if let Some(mut prev) = existing.remove(&new.pid) {
-                    // Preserve accumulated state, update ephemeral fields
-                    prev.elapsed = new.elapsed;
-                    prev.started_at = new.started_at;
-                    // cwd/project_name/session_id don't change
-                    prev
+                if let Some(prev) = existing.remove(&new.pid) {
+                    merge_discovered_session(prev, new)
                 } else {
                     // Brand new session
                     new_pids.push(new.pid);
@@ -3603,6 +3599,29 @@ fn project_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Merge a freshly discovered session into the previous one for the same PID.
+/// Normally the accumulated transcript state (tokens, context, byte offset, chat)
+/// is preserved and only the ephemeral process fields are refreshed. But when the
+/// PID keeps running while its underlying *session id* changes — the user ran
+/// `/clear`, which starts a brand-new conversation/transcript in the same process
+/// — that accumulated state belongs to the old conversation and must be dropped
+/// so context/tokens reset and the new transcript is re-resolved (BACKLOG:
+/// context should reset on /clear). The fresh `new` already carries zeroed
+/// transcript state and `jsonl_path: None`; we keep `prev`'s CPU history since
+/// it's the same OS process.
+fn merge_discovered_session(prev: ClaudeSession, new: ClaudeSession) -> ClaudeSession {
+    if prev.session_id == new.session_id {
+        let mut merged = prev;
+        merged.elapsed = new.elapsed;
+        merged.started_at = new.started_at;
+        merged
+    } else {
+        let mut fresh = new;
+        fresh.cpu_history = prev.cpu_history;
+        fresh
+    }
+}
+
 /// Actionability rank for roster ordering (from agent-deck): a blocked agent is
 /// more urgent than a busy or expensive one. Lower sorts first.
 fn status_urgency(status: SessionStatus) -> u8 {
@@ -3946,6 +3965,65 @@ mod tests {
         };
         session.usage_metrics_available = telemetry_available;
         session
+    }
+
+    #[test]
+    fn merge_resets_transcript_state_when_session_id_changes() {
+        // BACKLOG /clear: same PID, new session id → drop the old conversation's
+        // accumulated tokens/context/offset/path, keep CPU history (same process).
+        let mut prev = ClaudeSession::from_raw(RawSession {
+            pid: 100,
+            session_id: "old-session".into(),
+            cwd: "/tmp/p".into(),
+            started_at: 1,
+        });
+        prev.context_tokens = 62_000;
+        prev.own_input_tokens = 5_000;
+        prev.cost_usd = 1.23;
+        prev.jsonl_path = Some(PathBuf::from("/old.jsonl"));
+        prev.jsonl_offset = 999;
+        prev.cpu_history = vec![3.0, 4.0];
+
+        let new = ClaudeSession::from_raw(RawSession {
+            pid: 100,
+            session_id: "new-session".into(),
+            cwd: "/tmp/p".into(),
+            started_at: 2,
+        });
+
+        let merged = merge_discovered_session(prev, new);
+        assert_eq!(merged.session_id, "new-session");
+        assert_eq!(merged.context_tokens, 0, "context must reset on /clear");
+        assert_eq!(merged.own_input_tokens, 0);
+        assert_eq!(merged.cost_usd, 0.0);
+        assert!(merged.jsonl_path.is_none(), "must re-resolve the new transcript");
+        assert_eq!(merged.jsonl_offset, 0);
+        assert_eq!(merged.cpu_history, vec![3.0, 4.0], "same process — keep CPU history");
+    }
+
+    #[test]
+    fn merge_preserves_accumulated_state_for_the_same_session() {
+        let mut prev = ClaudeSession::from_raw(RawSession {
+            pid: 100,
+            session_id: "s".into(),
+            cwd: "/tmp/p".into(),
+            started_at: 1,
+        });
+        prev.context_tokens = 62_000;
+        prev.jsonl_offset = 999;
+        let mut new = ClaudeSession::from_raw(RawSession {
+            pid: 100,
+            session_id: "s".into(),
+            cwd: "/tmp/p".into(),
+            started_at: 5,
+        });
+        new.elapsed = std::time::Duration::from_secs(42);
+
+        let merged = merge_discovered_session(prev, new);
+        assert_eq!(merged.context_tokens, 62_000, "same session keeps its context");
+        assert_eq!(merged.jsonl_offset, 999);
+        assert_eq!(merged.started_at, 5, "ephemeral fields refresh");
+        assert_eq!(merged.elapsed, std::time::Duration::from_secs(42));
     }
 
     fn make_test_app() -> App {

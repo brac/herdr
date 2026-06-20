@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::session::{ClaudeSession, RawSession};
 
@@ -65,66 +65,72 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
 /// Resolve JSONL paths for sessions. Must be called AFTER command_args are populated
 /// (i.e., after fetch_ps_data), so we can use --resume UUIDs for correct mapping.
 pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
+    let base = projects_dir();
     for session in sessions.iter_mut() {
-        let slug = cwd_to_slug(&session.cwd);
-        let project_dir = projects_dir().join(&slug);
-
-        // Priority 1: Try the session's own ID in the expected project dir
-        let own_path = project_dir.join(format!("{}.jsonl", session.session_id));
-        if own_path.exists() {
-            session.jsonl_path = Some(own_path);
-            continue;
-        }
-
-        // Priority 2: Try the --resume UUID from command args
-        if let Some(resume_id) = extract_resume_uuid(&session.command_args) {
-            let resume_path = project_dir.join(format!("{resume_id}.jsonl"));
-            if resume_path.exists() {
-                session.jsonl_path = Some(resume_path);
-                continue;
-            }
-        }
-
-        // Priority 3: Fall back to most recently modified .jsonl in the project dir
-        if let Some(latest) = find_latest_jsonl(&project_dir) {
-            session.jsonl_path = Some(latest);
-            continue;
-        }
-
-        // Priority 4: Search ALL project directories for a JSONL matching the session ID.
-        // This handles cwd encoding mismatches between claudectl and Claude Code
-        // (e.g., symlink resolution, path normalization differences).
-        if let Some(found) = search_all_projects_for_session(&session.session_id) {
-            crate::logger::log(
-                "DEBUG",
-                &format!(
-                    "session {}: slug mismatch — found JSONL via project scan: {}",
-                    session.session_id,
-                    found.display()
-                ),
-            );
-            session.jsonl_path = Some(found);
-            continue;
-        }
-
-        crate::logger::log(
-            "DEBUG",
-            &format!(
-                "session {}: no JSONL found (slug={}, project_dir_exists={})",
-                session.session_id,
-                slug,
-                project_dir.exists()
-            ),
-        );
+        resolve_session_jsonl(session, &base);
     }
 }
 
-/// Search all directories under ~/.claude/projects/ for a JSONL file matching the session ID.
-/// This is a fallback when the cwd-based slug doesn't match the actual directory on disk.
-fn search_all_projects_for_session(session_id: &str) -> Option<PathBuf> {
+/// Attach a session's transcript **by session id only** — never by guessing the
+/// most-recently-modified file in the project dir. A freshly launched agent (or
+/// one whose conversation was just reset with `/clear`) has no transcript named
+/// for its id yet, so it stays `None` (telemetry Pending) until its own
+/// `<session_id>.jsonl` appears — rather than inheriting the *previous* session's
+/// transcript and showing its context/status (BACKLOG: status/context incorrect
+/// on launch; context should reset on /clear).
+fn resolve_session_jsonl(session: &mut ClaudeSession, projects_base: &Path) {
+    let slug = cwd_to_slug(&session.cwd);
+    let project_dir = projects_base.join(&slug);
+
+    // Priority 1: the session's own id in the expected project dir.
+    let own_path = project_dir.join(format!("{}.jsonl", session.session_id));
+    if own_path.exists() {
+        session.jsonl_path = Some(own_path);
+        return;
+    }
+
+    // Priority 2: a --resume UUID from the command args.
+    if let Some(resume_id) = extract_resume_uuid(&session.command_args) {
+        let resume_path = project_dir.join(format!("{resume_id}.jsonl"));
+        if resume_path.exists() {
+            session.jsonl_path = Some(resume_path);
+            return;
+        }
+    }
+
+    // Priority 3: the session id in ANY project dir. Handles cwd-encoding/slug
+    // mismatches between herdr and Claude Code (symlink resolution, path
+    // normalization) — still an exact session-id match, never a guess.
+    if let Some(found) = search_all_projects_for_session(projects_base, &session.session_id) {
+        crate::logger::log(
+            "DEBUG",
+            &format!(
+                "session {}: slug mismatch — found JSONL via project scan: {}",
+                session.session_id,
+                found.display()
+            ),
+        );
+        session.jsonl_path = Some(found);
+        return;
+    }
+
+    crate::logger::log(
+        "DEBUG",
+        &format!(
+            "session {}: no JSONL found (slug={}, project_dir_exists={})",
+            session.session_id,
+            slug,
+            project_dir.exists()
+        ),
+    );
+}
+
+/// Search all directories under `projects_base` for a JSONL file matching the
+/// session ID. A fallback when the cwd-based slug doesn't match the actual
+/// directory on disk.
+fn search_all_projects_for_session(base: &Path, session_id: &str) -> Option<PathBuf> {
     let filename = format!("{session_id}.jsonl");
-    let base = projects_dir();
-    let entries = fs::read_dir(&base).ok()?;
+    let entries = fs::read_dir(base).ok()?;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -152,25 +158,6 @@ fn extract_resume_uuid(command_args: &str) -> Option<String> {
     // Strip surrounding quotes
     let token = token.trim_matches('"').trim_matches('\'');
     Some(token.to_string())
-}
-
-/// Find the most recently modified .jsonl file in a project directory.
-fn find_latest_jsonl(dir: &PathBuf) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let modified = entry.metadata().ok()?.modified().ok()?;
-        if best.as_ref().is_none_or(|(_, t)| modified > *t) {
-            best = Some((path, modified));
-        }
-    }
-
-    best.map(|(p, _)| p)
 }
 
 /// Feature #29: Scan for subagent task .jsonl files.
@@ -338,6 +325,62 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn touch_jsonl(dir: &Path, stem: &str) -> PathBuf {
+        let path = dir.join(format!("{stem}.jsonl"));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn resolves_transcript_by_session_id_in_its_slug_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let cwd = "/home/u/proj";
+        let dir = base.path().join(cwd_to_slug(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        let own = touch_jsonl(&dir, id);
+        // A newer, foreign transcript that the old "latest jsonl" heuristic would
+        // have wrongly grabbed.
+        touch_jsonl(&dir, "22222222-2222-2222-2222-222222222222");
+
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            started_at: 0,
+        });
+        resolve_session_jsonl(&mut s, base.path());
+        assert_eq!(s.jsonl_path.as_deref(), Some(own.as_path()));
+    }
+
+    #[test]
+    fn fresh_session_does_not_inherit_a_foreign_transcript() {
+        // BACKLOG (status/context incorrect on launch; /clear reset): a session
+        // whose own <id>.jsonl doesn't exist yet must stay unresolved, NOT adopt
+        // the previous session's most-recent transcript.
+        let base = tempfile::tempdir().unwrap();
+        let cwd = "/home/u/proj";
+        let dir = base.path().join(cwd_to_slug(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        touch_jsonl(&dir, "99999999-9999-9999-9999-999999999999"); // a prior session
+
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 2,
+            session_id: "fresh-session-with-no-file-yet".into(),
+            cwd: cwd.into(),
+            started_at: 0,
+        });
+        resolve_session_jsonl(&mut s, base.path());
+        assert!(
+            s.jsonl_path.is_none(),
+            "a fresh agent must not inherit another session's transcript"
+        );
+    }
 
     #[test]
     fn slug_basic_path() {

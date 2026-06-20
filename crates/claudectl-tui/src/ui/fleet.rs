@@ -50,13 +50,40 @@ pub fn render_fleet_strip(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     // Cross-session history (not derivable from the live roster at all).
+    // today/wk cost + wk tokens (BACKLOG "wk token tracker"), then the all-time
+    // collection totals (BACKLOG "Persistent cost").
     let w = &app.weekly_summary;
+    let a = &app.all_time_summary;
     spans.push(Span::styled(
-        format!("   \u{2502}  today ${:.2} \u{00b7} wk ${:.2}", w.today_cost_usd, w.cost_usd),
+        format!(
+            "   \u{2502}  today ${:.2} \u{00b7} wk ${:.2} ({})",
+            w.today_cost_usd,
+            w.cost_usd,
+            fmt_tokens(w.total_tokens),
+        ),
+        dim,
+    ));
+    spans.push(Span::styled(
+        format!(
+            "   \u{2502}  all ${:.2} ({})",
+            a.cost_usd,
+            fmt_tokens(a.total_tokens),
+        ),
         dim,
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Compact token count for the strip: "1.2M tok" / "450k tok" / "37 tok".
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tok", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k tok", n as f64 / 1_000.0)
+    } else {
+        format!("{n} tok")
+    }
 }
 
 /// Render a slice of values as a unicode block sparkline, scaled to the slice's
@@ -85,7 +112,14 @@ fn spark(history: &[f64]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::spark;
+    use super::{fmt_tokens, spark};
+
+    #[test]
+    fn fmt_tokens_scales_units() {
+        assert_eq!(fmt_tokens(37), "37 tok");
+        assert_eq!(fmt_tokens(45_000), "45k tok");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M tok");
+    }
 
     #[test]
     fn empty_history_is_a_dash() {

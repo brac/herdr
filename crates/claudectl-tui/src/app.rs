@@ -453,6 +453,9 @@ pub struct App {
     pub budget_killed: HashSet<u32>, // PIDs that have been killed
     pub theme: Theme,
     pub weekly_summary: claudectl_core::history::WeeklySummary,
+    /// All-time persistent cost/tokens (collection-wide + per project), refreshed
+    /// on the same cadence as `weekly_summary`.
+    pub all_time_summary: claudectl_core::history::AllTimeSummary,
     pub weekly_summary_tick: u32, // Refresh every N ticks
     pub hooks: HookRegistry,
     pub daily_limit: Option<f64>,
@@ -768,6 +771,7 @@ impl App {
             budget_killed: HashSet::new(),
             theme: Theme::from_mode(claudectl_core::theme::ThemeMode::Dark),
             weekly_summary: claudectl_core::history::weekly_summary(),
+            all_time_summary: claudectl_core::history::all_time_summary(),
             weekly_summary_tick: 0,
             hooks: HookRegistry::new(),
             daily_limit: None,
@@ -1767,6 +1771,7 @@ impl App {
         if self.weekly_summary_tick >= 15 {
             self.weekly_summary_tick = 0;
             self.weekly_summary = claudectl_core::history::weekly_summary();
+            self.all_time_summary = claudectl_core::history::all_time_summary();
             self.check_aggregate_budgets();
         }
 

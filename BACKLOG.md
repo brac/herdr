@@ -9,10 +9,14 @@ The auto heigh feature should not count unactive repos, or repos without any act
 should only make room for showing repos with active agents, leeaving the rest of the screen space to the change window
 > Resolved: `stage_top_rows()` counts only agent-bearing project rows (test `stage_top_rows_ignores_idle_zero_agent_projects`).
 
-## Feature: Tabbed Agents
+## Feature: Tabbed Agents - DONE
 When an agent is active in a project, I want it indnetd so I can clearly see that the agent is under that project.
 If an agent opens sub agents under it's perview, if possible I want those indended in that agent which is indented 
 under the project. 
+> Resolved: agent rows are now indented (`AGENT_INDENT`) under their project header in grouped view,
+> and sub-agents nest one level deeper still (their `├─`/`└─` tree glyphs were already there), so the
+> roster reads project → agent → sub-agent. Indent is suppressed in flat view (no header to nest under).
+> `ui/table.rs` (`session_row`/`subagent_row`).
 
 ## Bug: Status and Context is sometimes incorrect - PARTIAL
 I select a row in herdr, I press n to start an agent, it sarts and in herdr is report 15% context used up and processing already?
@@ -55,15 +59,21 @@ using /clear on an agent window should reflect in herdr that the context has bee
 Can tmux add a border to the claude window just as herdr has it's own window title and border ie 
 -herdr-----
 
-## Feature: Persistent cost - PARTIAL
+## Feature: Persistent cost - DONE
 A value that reflects the cost over multiple (all) sessions. For the repo collection as a whole and individual projects. 
-> Partial: the Phase 5 fleet strip shows aggregate **today / week** cost (`history::weekly_summary`).
-> Still open: all-time totals and **per-project** persistent cost.
+> Resolved: `history::all_time_summary()` rolls the full history CSV into collection-wide totals **and**
+> a per-project map (`ProjectTotal`). The fleet strip shows **all $X (tokens)** for the collection;
+> each project header shows its all-time spend as **Σ$X** (matched by name; shown even for idle projects
+> with past sessions). Cached on `App.all_time_summary`, refreshed on the weekly-summary cadence (~30s).
+> Limitation: per-project match is by `display_name`, so a custom session name won't fold into the dir.
 
-## Feature: Quickstart
+## Feature: Quickstart - DONE
 A script to quickly launch tmux and start herdr
 tmux attach -t work
 cargo run --release -- "/mnt/c/Users/Ben Bracamonte/Work"
+> Resolved: `./quickstart.sh [PARENT_DIR]` — rebuilds release (never a stale binary), then creates or
+> reuses a tmux session (default `work`, override `HERDR_SESSION`) with herdr running over PARENT_DIR
+> (defaults to the repo's parent dir; handles paths with spaces). Switches client if already in tmux.
 
 ## Feature: Add Mouse Scrolling
 set -g mouse on
@@ -79,10 +89,11 @@ What kind of charts would be informative that we could display along side ond be
 > in the roster (Context bar + Activity sparkline columns). Optional next: daily-cost BarChart or a
 > dedicated graphs overlay if the strip earns the space.
 
-## Feature: wk token tracker - PARTIAL
+## Feature: wk token tracker - DONE
 We need a way to track token usage over multiple sessions
-> Partial: `history::weekly_summary` already aggregates week cost **and** tokens; the fleet strip surfaces
-> week *cost*. Still open: a token-specific multi-session readout (the strip shows $, not tokens).
+> Resolved: the fleet strip now surfaces **wk tokens** alongside wk cost, plus **all-time tokens** in the
+> new all-time segment (`ui/fleet.rs`, `fmt_tokens`). Multi-session token totals come from
+> `history::weekly_summary.total_tokens` and `history::all_time_summary().total_tokens`.
 
 ## Bug: Asking for permission in roster doesnt work - PARTIAL
 when waiting for an approavl to run a tool, there is no indicator in herdr roster view that it needs attention or can be arrpoved. Sometimes I see a 

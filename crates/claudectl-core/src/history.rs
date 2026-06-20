@@ -347,6 +347,57 @@ pub fn weekly_summary() -> WeeklySummary {
     }
 }
 
+/// Per-project rollup within the all-time summary.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectTotal {
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+    pub session_count: usize,
+}
+
+/// All-time usage across every recorded session (BACKLOG: "Persistent cost" —
+/// the repo collection as a whole *and* per project). Derived by scanning the
+/// full history CSV; cheap relative to the TUI's ~30s summary refresh.
+#[derive(Debug, Clone, Default)]
+pub struct AllTimeSummary {
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+    pub session_count: usize,
+    /// Keyed by the record's `project` field (a session's `display_name()`), so
+    /// it matches a project's directory name unless a custom session name was set.
+    pub per_project: std::collections::HashMap<String, ProjectTotal>,
+}
+
+impl AllTimeSummary {
+    /// All-time total for a project by its history name. `None` when that project
+    /// has no recorded sessions yet.
+    pub fn project(&self, name: &str) -> Option<&ProjectTotal> {
+        self.per_project.get(name)
+    }
+}
+
+/// Compute the all-time cost/token summary (collection-wide + per project).
+pub fn all_time_summary() -> AllTimeSummary {
+    aggregate_all_time(&load_history(None))
+}
+
+/// Pure rollup of records into an [`AllTimeSummary`] (split out so it's testable
+/// without touching the on-disk history file).
+fn aggregate_all_time(records: &[SessionRecord]) -> AllTimeSummary {
+    let mut summary = AllTimeSummary::default();
+    for r in records {
+        let tokens = r.input_tokens + r.output_tokens;
+        summary.cost_usd += r.cost_usd;
+        summary.total_tokens += tokens;
+        summary.session_count += 1;
+        let entry = summary.per_project.entry(r.project.clone()).or_default();
+        entry.cost_usd += r.cost_usd;
+        entry.total_tokens += tokens;
+        entry.session_count += 1;
+    }
+    summary
+}
+
 /// Parse a duration string like "24h", "30m", "7d" into seconds.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -436,5 +487,35 @@ mod tests {
         assert!(is_leap(2024));
         assert!(!is_leap(1900));
         assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn aggregate_all_time_rolls_up_collection_and_per_project() {
+        let rec = |project: &str, input: u64, output: u64, cost: f64| SessionRecord {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            pid: 1,
+            project: project.into(),
+            model: "sonnet".into(),
+            duration_secs: 60,
+            input_tokens: input,
+            output_tokens: output,
+            cost_usd: cost,
+        };
+        let records = vec![
+            rec("alpha", 100, 50, 1.0),
+            rec("alpha", 200, 100, 2.0),
+            rec("beta", 10, 5, 0.5),
+        ];
+        let s = aggregate_all_time(&records);
+        assert_eq!(s.session_count, 3);
+        assert!((s.cost_usd - 3.5).abs() < 1e-9);
+        assert_eq!(s.total_tokens, 465);
+
+        let alpha = s.project("alpha").expect("alpha present");
+        assert_eq!(alpha.session_count, 2);
+        assert!((alpha.cost_usd - 3.0).abs() < 1e-9);
+        assert_eq!(alpha.total_tokens, 450);
+        assert_eq!(s.project("beta").unwrap().total_tokens, 15);
+        assert!(s.project("missing").is_none());
     }
 }

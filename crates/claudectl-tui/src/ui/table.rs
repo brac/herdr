@@ -254,6 +254,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                         ));
                     }
                 }
+                // Persistent per-project cost (BACKLOG "Persistent cost"): all-time
+                // spend for this project from history, matched by name. Shown even
+                // for idle projects that have past sessions. `Σ` = all-time total.
+                if let Some(pt) = app.all_time_summary.project(&group.name) {
+                    if pt.cost_usd > 0.0 {
+                        header_spans.push(Span::styled(
+                            format!("  \u{03a3}${:.2}", pt.cost_usd),
+                            Style::default().fg(t.text_muted),
+                        ));
+                    }
+                }
                 let mut cells: Vec<Cell> =
                     vec![Cell::from(""), Cell::from(Line::from(header_spans))];
                 for _ in 2..11 {
@@ -496,6 +507,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Leading indent for an agent row's Project cell, so agents read as children
+/// of their project header (BACKLOG "Tabbed Agents"). Sub-agents nest one level
+/// deeper still — their tree glyph sits at `AGENT_INDENT` + this again.
+const AGENT_INDENT: &str = "  ";
+
 fn render_rows_for_session(s: &ClaudeSession, app: &App) -> Vec<Row<'static>> {
     let mut rows = vec![session_row(s, app)];
     let breakdown = s.subagent_breakdown();
@@ -580,14 +596,17 @@ fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
     } else {
         format!(" {health_icon}")
     };
+    // Indent agents under their project header (grouped view only — the flat
+    // list has no parent header to nest beneath).
+    let indent = if app.grouped_view { AGENT_INDENT } else { "" };
     let project_text = if s.subagent_count > 0 {
         format!(
-            "{prefix}{} +{}{health_suffix}",
+            "{indent}{prefix}{} +{}{health_suffix}",
             s.display_name(),
             s.subagent_count
         )
     } else {
-        format!("{prefix}{}{health_suffix}", s.display_name())
+        format!("{indent}{prefix}{}{health_suffix}", s.display_name())
     };
 
     let ctx_pct = s.context_percent();
@@ -651,7 +670,13 @@ fn subagent_row(row: &SubagentBreakdown, app: &App, index: usize, total: usize) 
     } else {
         "\u{251c}\u{2500} "
     };
-    let project_text = format!("{branch}{}", row.display_label());
+    // Nest one level under the agent (which itself sits at the project indent in
+    // grouped view), so the tree reads project → agent → sub-agent.
+    let agent_indent = if app.grouped_view { AGENT_INDENT } else { "" };
+    let project_text = format!(
+        "{agent_indent}{AGENT_INDENT}{branch}{}",
+        row.display_label()
+    );
     let status_text = row.state_label();
     let status_style = match row.state {
         SubagentState::Active => Style::default().fg(t.status_processing),

@@ -1,6 +1,7 @@
 // `brain` (full-screen Brain Review surface) stays in the binary crate as
 // `src/brain_screen.rs` — it depends on `brain::metrics` and `brain::risk`
 // which are binary-only modules. main.rs calls it directly.
+pub mod approval;
 pub mod chat;
 pub mod detail;
 pub mod help;

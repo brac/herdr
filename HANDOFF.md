@@ -7,7 +7,7 @@ lives). Run `herdr-check` before committing.
 
 ## Done and on `origin/main`
 
-- **Phases 0–3, 2.5, 4a, 4b** complete. Plus a run of live-workflow fixes driven by real use.
+- **Phases 0–3, 2.5, 4a, 4b, 4c** complete. Plus a run of live-workflow fixes driven by real use.
 - **Discovery slug fix** — `cwd_to_slug` hyphenates *all* non-alphanumerics (was `/`-only; broke on
   the `Ben Bracamonte` space path).
 - **Phase 2.5 event-driven refresh** — `notify` watcher thread → mpsc; 2s safety-net tick.
@@ -31,18 +31,30 @@ lives). Run `herdr-check` before committing.
 Tests ~170, clippy `-D warnings` clean, release ~1.6 MB, deps minimal (`notify` is the only Phase-2.5+
 addition; `tempfile` is dev-only).
 
+## Phase 4c — as built
+
+Roster-level **approval inspector** (decided over the chat-view placement: the staged pane already
+lets you approve in-pane, so the value is approving *without switching panes*).
+- New key **`A`** on the selected agent opens a centered modal (`ui/approval.rs`). Instant **`y`**
+  approve was kept unchanged — `A` is the additive inspect-then-act path.
+- The modal scrapes the agent's pane via **`tmux capture-pane -p`** (`terminals::capture_pane`,
+  tmux-only read-only scrape — §0.1/§8) and shows the tail (the dialog sits at the pane bottom).
+- In-modal keys: **`y`** approve (Enter→pane), **`n`** deny, **`i`** interrupt (both Esc→pane via
+  `terminals::deny_session`/`interrupt_session`), **`r`** re-capture, **`Esc`** cancel. A failed act
+  keeps the modal open so you can retry.
+- Backends added in `terminals/`: `capture_pane`, `deny_session`, `interrupt_session` (shared
+  `send_escape`), and `tmux::send_key` (named-key send-keys, distinct from literal-text `send_input`).
+- Guards: non-agent / remote / no-tmux all no-op with a hint. No new deps; binary ~1.72 MB.
+- **Known latent quirk (pre-existing, not introduced here):** an agent with an *empty* tty matches
+  the first tmux pane (`pane_tty.contains("")` is always true) — same in `send_input`. Real agents
+  have a tty, so it doesn't bite in practice; worth tightening if it ever does.
+
 ## Not done / next candidates
 
-1. **Phase 4c** — the remaining Phase 4 piece: one-key **approve / deny / interrupt** (`y`/`n`/`Esc`
-   → `terminals::approve_session` + decline/interrupt keystrokes) and **`tmux capture-pane`** to render
-   the *actual* permission dialog (invisible in JSONL). Plan in `PHASE4_PLAN.md` Part B. **Note:** with
-   the real Claude pane now embedded (stage), the user often approves directly in that pane — 4c is
-   most valuable as a roster-level "approve without switching panes" affordance. Confirm it's still
-   wanted before building.
-2. **Phase 5 — graphs** (sparklines/gauges) once we know which numbers earn a permanent spot.
-3. **Dynamic stage auto-height** — currently re-fits only on stage/launch (so it never fights a manual
+1. **Phase 5 — graphs** (sparklines/gauges) once we know which numbers earn a permanent spot.
+2. **Dynamic stage auto-height** — currently re-fits only on stage/launch (so it never fights a manual
    `Ctrl-b` resize). User was offered a "re-fit on refresh with change-detection" variant; not built.
-4. **Excise dormant residuals** — the inert `MockRuntime`/`rules`/`Orchestrator` bits (see map's
+3. **Excise dormant residuals** — the inert `MockRuntime`/`rules`/`Orchestrator` bits (see map's
    orchestrator-strip audit). Cleaner to remove now that real backends exist for input/kill.
 
 ## Gotchas (these have each cost a session)

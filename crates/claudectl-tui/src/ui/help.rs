@@ -41,6 +41,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("  Approve (send Enter to NeedsInput)"),
         ]),
         Line::from(vec![
+            Span::styled("  A              ", Style::default().fg(t.highlight_key)),
+            Span::raw("  Approval inspector — see the captured prompt, then y approve / n deny / i interrupt"),
+        ]),
+        Line::from(vec![
             Span::styled("  i              ", Style::default().fg(t.highlight_key)),
             Span::raw("  Input mode (type text to session)"),
         ]),

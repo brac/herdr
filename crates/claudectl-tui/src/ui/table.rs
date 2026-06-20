@@ -463,6 +463,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         render_status_bar(frame, chunks[next_chunk], app);
     }
 
+    // Approval inspector modal (Phase 4c) — sits above the roster like help.
+    if app.approval_pid.is_some() {
+        super::approval::render_approval_modal(frame, area, app);
+    }
+
     // Help overlay
     if app.show_help {
         render_help_overlay(frame, area, app);

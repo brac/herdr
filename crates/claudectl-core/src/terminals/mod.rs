@@ -1192,6 +1192,54 @@ pub fn approve_session(session: &ClaudeSession) -> Result<(), String> {
     }
 }
 
+/// Phase 4c: capture the agent's pane text (the rendered permission dialog,
+/// invisible in the JSONL) so herdr can show *what* is being approved before you
+/// act. tmux-only read-only scrape (CLAUDE.md §0.1); other terminals return
+/// `None` and the inspector opens without a preview.
+pub fn capture_pane(session: &ClaudeSession) -> Option<String> {
+    match detect_terminal() {
+        Terminal::Tmux => tmux::capture_pane(session),
+        _ => None,
+    }
+}
+
+/// Phase 4c: decline a pending permission prompt by sending Escape to the agent's
+/// pane (Claude Code's "No / tell Claude what to do" path). Mechanically the same
+/// keystroke as [`interrupt_session`]; kept separate so the intent — and any
+/// future divergence — stays explicit at the call site.
+pub fn deny_session(session: &ClaudeSession) -> Result<(), String> {
+    send_escape(session)
+}
+
+/// Phase 4c: interrupt the agent (cancel current work) by sending Escape to its
+/// pane.
+pub fn interrupt_session(session: &ClaudeSession) -> Result<(), String> {
+    send_escape(session)
+}
+
+/// Send an Escape keystroke to the agent's pane via the inherited backend.
+/// tmux uses a named-key send-keys; macOS falls back to System Events key code
+/// 53 (Escape) after focusing the pane.
+fn send_escape(session: &ClaudeSession) -> Result<(), String> {
+    match detect_terminal() {
+        Terminal::Tmux => tmux::send_key(session, "Escape"),
+        Terminal::WindowsTerm => Err(
+            "Windows Terminal currently supports WSL launch only. Use tmux or Kitty inside WSL for decline/interrupt."
+                .into(),
+        ),
+        #[cfg(target_os = "macos")]
+        _ => {
+            switch_to_terminal(session)?;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            run_osascript(r#"tell application "System Events" to key code 53"#)
+        }
+        #[cfg(not(target_os = "macos"))]
+        _ => Err(
+            "Decline/interrupt injection needs tmux. Run `claudectl --doctor` for details.".into(),
+        ),
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn run_osascript(script: &str) -> Result<(), String> {
     let output = std::process::Command::new("osascript")

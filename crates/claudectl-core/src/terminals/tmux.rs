@@ -145,6 +145,17 @@ pub fn switch(session: &ClaudeSession) -> Result<(), String> {
 }
 
 pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+    let target = pane_target_for_tty(&session.tty).ok_or("TTY not found in tmux")?;
+    let _ = std::process::Command::new("tmux")
+        .args(["send-keys", "-t", &target, text, ""])
+        .output();
+    Ok(())
+}
+
+/// Resolve the `session:window.pane` target string for an agent's tty — the form
+/// `send-keys`/`capture-pane` accept. `None` when the tty isn't found in any
+/// tmux pane.
+fn pane_target_for_tty(tty: &str) -> Option<String> {
     let output = std::process::Command::new("tmux")
         .args([
             "list-panes",
@@ -153,19 +164,46 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
             "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}",
         ])
         .output()
-        .map_err(|e| format!("tmux failed: {e}"))?;
-
+        .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 && parts[0].contains(&session.tty) {
-            let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", parts[1], text, ""])
-                .output();
-            return Ok(());
+        if let Some((pane_tty, target)) = line.split_once(' ') {
+            if pane_tty.contains(tty) {
+                return Some(target.to_string());
+            }
         }
     }
+    None
+}
 
-    Err("TTY not found in tmux".into())
+/// Send a tmux *named key* (e.g. `Escape`) to the agent's pane. Distinct from
+/// [`send_input`], which sends literal text: tmux interprets the bare key name,
+/// so this is how Phase 4c decline/interrupt deliver an Escape keystroke.
+pub fn send_key(session: &ClaudeSession, key: &str) -> Result<(), String> {
+    let target = pane_target_for_tty(&session.tty).ok_or("TTY not found in tmux")?;
+    let output = std::process::Command::new("tmux")
+        .args(["send-keys", "-t", &target, key])
+        .output()
+        .map_err(|e| format!("tmux send-keys failed: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Capture the visible text of the agent's pane — the *rendered* terminal, which
+/// is where Claude Code's permission dialog lives (it never reaches the JSONL).
+/// Read-only scraping for a preview (CLAUDE.md §0.1, §8), not a terminal
+/// emulator. `None` if the pane can't be found or tmux fails.
+pub fn capture_pane(session: &ClaudeSession) -> Option<String> {
+    let target = pane_target_for_tty(&session.tty)?;
+    let output = std::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &target])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }

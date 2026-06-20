@@ -311,6 +311,36 @@ impl GitStatusService {
     }
 }
 
+/// Phase 4c approval-inspector action delivered to an agent's pane. Each maps to
+/// a keystroke via the inherited `terminals/` backend (approve = Enter, deny /
+/// interrupt = Escape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalAct {
+    Approve,
+    Deny,
+    Interrupt,
+}
+
+impl ApprovalAct {
+    /// Verb for an error status ("Approve failed: …").
+    fn verb(self) -> &'static str {
+        match self {
+            ApprovalAct::Approve => "Approve",
+            ApprovalAct::Deny => "Deny",
+            ApprovalAct::Interrupt => "Interrupt",
+        }
+    }
+
+    /// Past tense for a success status ("Approved foo").
+    fn past_tense(self) -> &'static str {
+        match self {
+            ApprovalAct::Approve => "Approved",
+            ApprovalAct::Deny => "Denied",
+            ApprovalAct::Interrupt => "Interrupted",
+        }
+    }
+}
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -483,6 +513,14 @@ pub struct App {
     /// Whether this terminal can inject keystrokes into agent panes (computed
     /// once at startup). False outside tmux/Kitty on WSL → chat is read-only.
     pub input_supported: bool,
+    /// Phase 4c approval inspector: PID of the agent whose permission prompt is
+    /// being inspected (modal open when `Some`). `A` opens it for the selected
+    /// agent; y/n/i act, Esc closes. None = no modal.
+    pub approval_pid: Option<u32>,
+    /// Captured tmux pane text (the rendered permission dialog) shown in the
+    /// approval inspector so you can see *what* you're approving (CLAUDE.md §0.1
+    /// read-only scrape). Empty when the capture failed or isn't available.
+    pub approval_preview: String,
     /// The tmux pane id of the agent currently shown in herdr's split "stage"
     /// (only one at a time). `o` swaps it; launches replace it. None = nothing staged.
     pub staged_pane: Option<String>,
@@ -753,6 +791,8 @@ impl App {
             chat_scroll: 0,
             chat_input: String::new(),
             input_supported: terminals::supports_input(),
+            approval_pid: None,
+            approval_preview: String::new(),
             staged_pane: None,
             brain_tab: BrainTab::Scorecard,
             brain_review_selected: 0,
@@ -2244,6 +2284,13 @@ impl App {
             return true;
         }
 
+        // Approval inspector modal (Phase 4c): y approve / n deny / i interrupt /
+        // r re-capture / Esc cancel. Captured keys never reach normal mode.
+        if self.approval_pid.is_some() {
+            self.handle_approval_key(key);
+            return true;
+        }
+
         // Override reason prompt: waiting for 1/2/3/Esc
         if self.pending_override_reason.is_some() {
             match key.code {
@@ -2812,6 +2859,11 @@ impl App {
                 self.cancel_pending_auto_approve();
                 self.handle_approve();
             }
+            (KeyCode::Char('A'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.open_approval_inspector();
+            }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
@@ -3268,6 +3320,93 @@ impl App {
         }
     }
 
+    /// Phase 4c: open the approval inspector for the selected agent. Scrapes the
+    /// agent's tmux pane (`capture-pane`) so the *actual* permission dialog —
+    /// invisible in the JSONL — is shown before you approve/deny/interrupt
+    /// without switching panes. No-op (with a hint) for non-agents, remote
+    /// sessions, or terminals that can't inject keystrokes.
+    fn open_approval_inspector(&mut self) {
+        let Some(session) = self.selected_session().cloned() else {
+            self.status_msg = "Select an agent to inspect its prompt".into();
+            return;
+        };
+        if session.is_remote() {
+            self.status_msg = "Remote session \u{2014} action not available".into();
+            return;
+        }
+        if !self.input_supported {
+            self.status_msg =
+                "Approve/deny needs tmux \u{2014} run agents and herdr inside tmux (see ? help)"
+                    .into();
+            return;
+        }
+        // Best-effort capture: a failed/empty scrape still opens the modal (with a
+        // note), so deny/interrupt stay reachable even when the preview is blank.
+        self.approval_preview = terminals::capture_pane(&session).unwrap_or_default();
+        self.approval_pid = Some(session.pid);
+    }
+
+    /// Re-run the pane capture for the open inspector (the dialog may have
+    /// changed since it opened). No-op if the modal is closed.
+    fn refresh_approval_preview(&mut self) {
+        let Some(pid) = self.approval_pid else {
+            return;
+        };
+        if let Some(session) = self.sessions.iter().find(|s| s.pid == pid) {
+            self.approval_preview = terminals::capture_pane(session).unwrap_or_default();
+        }
+    }
+
+    /// Phase 4c approval-inspector keymap: `y`/Enter approve, `n` deny, `i`
+    /// interrupt, `r` re-capture the dialog, `Esc` cancel.
+    fn handle_approval_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => self.approval_act(ApprovalAct::Approve),
+            KeyCode::Char('n') => self.approval_act(ApprovalAct::Deny),
+            KeyCode::Char('i') => self.approval_act(ApprovalAct::Interrupt),
+            KeyCode::Char('r') => self.refresh_approval_preview(),
+            KeyCode::Esc => {
+                self.approval_pid = None;
+                self.approval_preview.clear();
+                self.status_msg = "Cancelled".into();
+            }
+            _ => {}
+        }
+    }
+
+    /// Deliver the chosen action to the inspected agent's pane via the inherited
+    /// keystroke backend (CLAUDE.md §0 — we drive the existing pane, tmux owns the
+    /// process). Closes the modal on success; keeps it open on failure so the
+    /// error is visible and the user can retry.
+    fn approval_act(&mut self, act: ApprovalAct) {
+        let Some(pid) = self.approval_pid else {
+            return;
+        };
+        let outcome = match self.sessions.iter().find(|s| s.pid == pid) {
+            None => Err("Agent is no longer running".to_string()),
+            Some(s) if s.is_remote() => {
+                Err("Remote session \u{2014} action not available".to_string())
+            }
+            Some(s) => {
+                let name = s.display_name().to_string();
+                let result = match act {
+                    ApprovalAct::Approve => terminals::approve_session(s),
+                    ApprovalAct::Deny => terminals::deny_session(s),
+                    ApprovalAct::Interrupt => terminals::interrupt_session(s),
+                };
+                result.map(|()| name)
+            }
+        };
+        match outcome {
+            Ok(name) => {
+                self.status_msg = format!("{} {name}", act.past_tense());
+                self.approval_pid = None;
+                self.approval_preview.clear();
+            }
+            Err(msg) => self.status_msg = format!("{} failed: {msg}", act.verb()),
+        }
+    }
+
     fn handle_brain_accept(&mut self) {
         self.handle_brain_accept_with_reason(None);
     }
@@ -3618,6 +3757,10 @@ fn merge_discovered_session(prev: ClaudeSession, new: ClaudeSession) -> ClaudeSe
     } else {
         let mut fresh = new;
         fresh.cpu_history = prev.cpu_history;
+        // Same OS process across /clear — the CPU-time counter keeps climbing, so
+        // carry the sampling state or the next tick would see a huge spurious delta.
+        fresh.prev_cpu_secs = prev.prev_cpu_secs;
+        fresh.prev_cpu_sample_ms = prev.prev_cpu_sample_ms;
         fresh
     }
 }
@@ -4422,6 +4565,102 @@ mod tests {
         app.send_chat_input();
         assert!(app.status_msg.contains("tmux"));
         assert_eq!(app.chat_input, "hello", "blocked send must not clear the draft");
+    }
+
+    // ---- Phase 4c: approval inspector ----------------------------------------
+
+    /// Build a flat (non-grouped) app with one selected agent, so
+    /// `selected_session` resolves without project-header bookkeeping.
+    fn app_with_selected(session: ClaudeSession) -> App {
+        let mut app = App::new();
+        app.grouped_view = false;
+        app.sessions = vec![session];
+        app.table_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn approval_inspector_requires_a_selected_agent() {
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        app.table_state.select(None);
+        app.open_approval_inspector();
+        assert!(app.approval_pid.is_none());
+        assert!(app.status_msg.contains("Select an agent"));
+    }
+
+    #[test]
+    fn approval_inspector_blocks_remote_sessions() {
+        let mut s = make_session(7, "remote", "opus", SessionStatus::NeedsInput, 0.0, 0.0, true);
+        s.worker_origin = Some("worker-1".into());
+        let mut app = app_with_selected(s);
+        app.input_supported = true; // exercise the remote guard, not the tmux gate
+        app.open_approval_inspector();
+        assert!(app.approval_pid.is_none(), "remote session must not open the modal");
+        assert!(app.status_msg.contains("Remote session"));
+    }
+
+    #[test]
+    fn approval_inspector_needs_tmux() {
+        let s = make_session(3, "proj", "opus", SessionStatus::NeedsInput, 0.0, 0.0, true);
+        let mut app = app_with_selected(s);
+        app.input_supported = false; // e.g. plain WSL terminal, no tmux
+        app.open_approval_inspector();
+        assert!(app.approval_pid.is_none());
+        assert!(app.status_msg.contains("tmux"));
+    }
+
+    #[test]
+    fn approval_inspector_opens_for_selected_agent() {
+        let s = make_session(5, "proj", "opus", SessionStatus::NeedsInput, 0.0, 0.0, true);
+        let mut app = app_with_selected(s);
+        app.input_supported = true; // bypass the tmux gate
+        app.open_approval_inspector();
+        // Opens pinned to the agent. The preview is best-effort (empty when the
+        // capture fails), so we only assert the modal is now open.
+        assert_eq!(app.approval_pid, Some(5));
+    }
+
+    #[test]
+    fn approval_act_on_missing_agent_keeps_modal_open() {
+        let mut app = App::new();
+        app.sessions = Vec::new();
+        app.approval_pid = Some(999); // no such session
+        app.approval_act(ApprovalAct::Approve);
+        assert!(app.status_msg.contains("Approve failed"));
+        assert!(app.status_msg.contains("no longer running"));
+        assert_eq!(app.approval_pid, Some(999), "a failed act keeps the modal open to retry");
+    }
+
+    #[test]
+    fn approval_act_blocks_remote_sessions() {
+        let mut s = make_session(7, "remote", "opus", SessionStatus::NeedsInput, 0.0, 0.0, true);
+        s.worker_origin = Some("worker-1".into());
+        let mut app = App::new();
+        app.sessions = vec![s];
+        app.approval_pid = Some(7);
+        app.approval_act(ApprovalAct::Deny);
+        assert!(app.status_msg.contains("Remote session"));
+        assert_eq!(app.approval_pid, Some(7));
+    }
+
+    #[test]
+    fn approval_modal_esc_closes_without_acting() {
+        let mut app = App::new();
+        app.approval_pid = Some(1);
+        app.approval_preview = "Do you want to proceed?".into();
+        app.handle_approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.approval_pid.is_none());
+        assert!(app.approval_preview.is_empty());
+        assert!(app.status_msg.contains("Cancelled"));
+    }
+
+    #[test]
+    fn approval_act_labels_read_naturally() {
+        assert_eq!(ApprovalAct::Approve.verb(), "Approve");
+        assert_eq!(ApprovalAct::Approve.past_tense(), "Approved");
+        assert_eq!(ApprovalAct::Deny.past_tense(), "Denied");
+        assert_eq!(ApprovalAct::Interrupt.past_tense(), "Interrupted");
     }
 
     #[test]

@@ -191,21 +191,21 @@ pub fn generate_sessions(tick: u32) -> Vec<ClaudeSession> {
                 s.subagent_count = 2 + (tick as usize % 3);
             }
 
-            // Activity sparkline history
+            // Activity sparkline history (CPU% per tick). Processing varies for a
+            // granular demo sparkline; quiet states stay low.
             for t in 0..15 {
                 let past_tick = if tick > 15 { tick - 15 + t } else { t };
                 let past_status = seq[(past_tick as usize) % seq.len()];
-                let level = match past_status {
-                    SessionStatus::Processing => 7,
-                    SessionStatus::Error => 5,
-                    SessionStatus::NeedsInput => 4,
-                    SessionStatus::JobDone => 3,
-                    SessionStatus::WaitingInput => 2,
-                    SessionStatus::Unknown => 2,
-                    SessionStatus::Idle => 1,
-                    SessionStatus::Finished => 0,
+                let cpu: f32 = match past_status {
+                    SessionStatus::Processing => 30.0 + ((past_tick * 17) % 70) as f32,
+                    SessionStatus::Error => 5.0,
+                    SessionStatus::NeedsInput => 2.0,
+                    SessionStatus::WaitingInput => 8.0,
+                    SessionStatus::JobDone => 1.0,
+                    SessionStatus::Unknown => 4.0,
+                    SessionStatus::Idle | SessionStatus::Finished => 0.0,
                 };
-                s.activity_history.push(level);
+                s.activity_history.push(cpu);
             }
 
             // Worktree IDs — sessions 0 and 1 share same worktree (conflict!)

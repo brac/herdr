@@ -875,6 +875,10 @@ impl App {
             return;
         }
 
+        // Remember what's selected by stable identity so the cursor follows it
+        // across this tick's re-sort (BACKLOG: selection follows the launched repo).
+        let sel_key = self.selection_key();
+
         // Project-first roster: scan the parent dir for project directories.
         // Cheap local read; projects exist independent of agents (§2).
         self.projects = projects::scan(&self.parent_dir, self.include_non_git);
@@ -1317,6 +1321,8 @@ impl App {
         }
 
         self.normalize_selection();
+        // Re-anchor the cursor onto the same project/agent after the re-sort.
+        self.reselect_by_key(sel_key);
 
         // Record debug timings
         if self.debug {
@@ -3355,6 +3361,41 @@ impl App {
         }
     }
 
+    /// The stable identity of the currently selected row (project path for a
+    /// header, PID for an agent), or `None` if nothing is selected.
+    fn selection_key(&self) -> Option<RosterSelKey> {
+        let sel = self.table_state.selected()?;
+        let (groups, rows) = self.roster_layout();
+        match rows.get(sel)? {
+            RosterRow::Header(gi) => groups
+                .get(*gi)
+                .and_then(|g| g.path.clone())
+                .map(RosterSelKey::Project),
+            RosterRow::Agent(si) => self.sessions.get(*si).map(|s| RosterSelKey::Agent(s.pid)),
+        }
+    }
+
+    /// Move the cursor back onto `key`'s row after a re-sort, so selection follows
+    /// the same project/agent rather than whatever floated to that index. No-op if
+    /// the key is gone (the row no longer exists) — `normalize_selection` already
+    /// clamped the index in that case.
+    fn reselect_by_key(&mut self, key: Option<RosterSelKey>) {
+        let Some(key) = key else { return };
+        let (groups, rows) = self.roster_layout();
+        let found = rows.iter().position(|row| match (row, &key) {
+            (RosterRow::Header(gi), RosterSelKey::Project(p)) => {
+                groups.get(*gi).and_then(|g| g.path.as_ref()) == Some(p)
+            }
+            (RosterRow::Agent(si), RosterSelKey::Agent(pid)) => {
+                self.sessions.get(*si).map(|s| s.pid) == Some(*pid)
+            }
+            _ => false,
+        });
+        if let Some(idx) = found {
+            self.table_state.select(Some(idx));
+        }
+    }
+
     fn matches_filters(&self, session: &ClaudeSession) -> bool {
         self.status_filter.matches(session.status)
             && self.matches_focus_filter(session)
@@ -3823,6 +3864,15 @@ pub enum RosterRow {
     Agent(usize),
 }
 
+/// A *stable* identity for the selected roster row, so the cursor follows the
+/// same project/agent across re-sorts instead of staying on a drifting index
+/// (BACKLOG: selection should follow the repo an agent was launched into).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterSelKey {
+    Project(PathBuf),
+    Agent(u32),
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectGroup {
     pub name: String,
@@ -4067,7 +4117,11 @@ impl App {
         // +1 for the fleet trend strip when it's shown, so the staged pane below
         // reserves room for it too (auto-height, BACKLOG).
         let fleet = usize::from(self.show_fleet);
-        ((visual + 4 + fleet) as u16).clamp(6, 40)
+        // Floor of 12 rows so a single active agent + open chat isn't a cramped
+        // sliver (BACKLOG "Roster bar too small"). `terminals::cap_stage_top_rows`
+        // trims this back on short terminals so the agent pane keeps its minimum,
+        // so the floor never starves the staged pane.
+        ((visual + 4 + fleet) as u16).clamp(12, 40)
     }
 
     /// Working directory to launch a new agent into, derived from the current
@@ -4401,6 +4455,24 @@ mod tests {
         assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
     }
 
+    #[test]
+    fn reselect_by_key_follows_the_same_entity_across_a_resort() {
+        // BACKLOG "selection follows the launched repo": capturing the selection
+        // key and re-anchoring must land on the same project/agent regardless of
+        // where it now sits, not on whatever drifted into the old index.
+        let mut app = make_grouped_app();
+        app.table_state.select(Some(1)); // the agent row
+        let key = app.selection_key();
+        assert_eq!(key, Some(RosterSelKey::Agent(11)));
+
+        // Cursor knocked to a different row (as a re-sort would do)…
+        app.table_state.select(Some(0));
+        app.reselect_by_key(key.clone());
+        // …and re-anchored back onto the same agent.
+        assert_eq!(app.selection_key(), key);
+        assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
+    }
+
     /// Build an app whose grouped roster is deterministic: one active project
     /// ("alpha", hosting agent 11), one idle project ("idle", no agents). Roster
     /// order is `[Header(alpha), Agent(11), Header(idle)]` (active projects sort
@@ -4457,14 +4529,15 @@ mod tests {
         // BACKLOG auto-height: an idle, agent-less project header must NOT reserve
         // pane height. make_grouped_app has one active project ("alpha", agent 11)
         // and one idle project ("idle"). Only alpha's header + its one agent count:
-        // 1 header + 1 agent + 4 chrome = 6 (which is also the floor). Disable the
-        // fleet strip so this exercises idle-project handling, not the +1 strip row.
+        // 1 header + 1 agent + 4 chrome = 6, raised to the 12-row floor (BACKLOG
+        // "Roster bar too small"). Disable the fleet strip so this exercises
+        // idle-project handling, not the +1 strip row.
         let mut app = make_grouped_app();
         app.show_fleet = false;
-        assert_eq!(app.stage_top_rows(), 6);
+        assert_eq!(app.stage_top_rows(), 12);
 
         // Adding more idle projects must not grow the pane — only agent-bearing
-        // projects do. Height stays at the same 6 rows.
+        // projects do. Height stays at the 12-row floor.
         let mut padded = app;
         for i in 0..20 {
             padded.projects.push(Project {
@@ -4475,7 +4548,7 @@ mod tests {
         }
         assert_eq!(
             padded.stage_top_rows(),
-            6,
+            12,
             "idle repos must not inflate herdr's staged pane height"
         );
     }

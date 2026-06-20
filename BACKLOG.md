@@ -115,17 +115,27 @@ The nuimber is up and down and all over the palce. I feel like it should be the 
 > erratically. New `prev_cost_sample_ms` field on the session carries the sample baseline. Tests:
 > `smooth_burn_steadies_a_spiky_signal`, `smooth_burn_decays_toward_zero_when_idle`. (`app.rs` refresh).
 
-## Feature: Model identification
+## Feature: Model identification - DONE (detail view)
 Each agetn should have a indicator about which model they are current running.
+> Resolved via the existing **roster detail** (`Enter` → `ui/detail.rs` shows "Model: …", already
+> shortened by `models::shorten_model`). Per user decision, deliberately **not** added as a roster
+> column to keep the row uncluttered.
 
 ## Bug: Reszing the window changes the agent window size permenantly
 When reszing the window smaller they resize properlly. When resize the window larger with both the roster and the agent window open, then the agent window stays the compressed size while herdr gets bigger. Upon getting larger the agent window should take more of the screen space when possible while still maintaiing the min-height for the roster
 
-## Bug: Roster selection bar should stay with last repo selected when launching an agent.
+## Bug: Roster selection bar should stay with last repo selected when launching an agent. - DONE
 Launhcing an agent in the roster view with n. The repo will sort to the top with the now active agent, leaving the roster selection on an unintended repo. The selection bar should follow the now sorted repo. 
+> Resolved: selection is now sticky by *stable identity*, not row index. `refresh()` captures a
+> `RosterSelKey` (project path for a header, PID for an agent) before the re-sort and re-anchors the
+> cursor onto it afterward (`selection_key` / `reselect_by_key`). So after `n` the cursor follows the
+> launched repo to the top — and the roster no longer drifts under you on any status-driven re-sort.
+> Test `reselect_by_key_follows_the_same_entity_across_a_resort`.
 
-## Bug: Reoster bar is too small with only one or two active agents
+## Bug: Reoster bar is too small with only one or two active agents - DONE
 The roster bar should be a minimum for 12 rows when there are a small number of active agents. Ruight now there is one active agent and an open chat window and I see 7 rows. Header, Columns names, 2 repos, session overview and fleet bar.
+> Resolved: `stage_top_rows()` floor raised 6 → 12 rows. `terminals::cap_stage_top_rows` still trims it
+> on short terminals so the staged agent pane keeps its minimum, so the floor never starves the agent.
 
 ## Feature: Split waiting states - DONE
 If the agent is waiting for a repsonse from the API, the roster displays Waiting. The a task is complete the roster also dispalys Waiting. When a task is complete and the agent is waiting for the next task from the usr, then I want that task to be Job Done. So we can tell when we are waiting on the API and when we are waiting ont he user
@@ -142,6 +152,10 @@ Somtimes we hit an API error. The Roster should display Error in the stats when 
 > newer message supersedes it, and `infer_status` reports Error when CPU is low (an active retry stays
 > Processing). Tests `api_error_flag_reads_as_error_when_idle`, `active_retry_after_error_reads_as_processing`.
 
-## Bug: Sparklines
+## Bug: Sparklines - DONE
 The per agent sparklin looks like it only has two states, on and off
 The fleet sparkline has all sorts of varitaion. Make the roster sparkline more granula like the fleet sparkline
+> Resolved: `activity_history` now stores a continuous **CPU% per tick** (`Vec<f32>`) instead of a
+> discrete status level that only ever produced 1–2 bar heights. `format_sparkline` scales each bar
+> against a 100% ceiling (a multi-core spike clamps to full, idle ticks blank), giving fleet-strip-like
+> granularity. Test `sparkline_scales_cpu_to_block_heights`. (`session.rs`.)

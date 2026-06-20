@@ -148,7 +148,7 @@ pub struct ClaudeSession {
     pub active_subagent_count: usize,
     pub active_subagent_jsonl_paths: Vec<PathBuf>,
     pub subagent_rollups: HashMap<PathBuf, SubagentRollup>,
-    pub activity_history: Vec<u8>, // Ring buffer of status levels (0-7) for sparkline, one per tick
+    pub activity_history: Vec<f32>, // Ring buffer of CPU% per tick for the activity sparkline
     pub files_modified: HashMap<String, u32>, // file path -> edit count
     pub tool_usage: HashMap<String, ToolStats>, // tool name -> call count & tokens
     pub worktree_id: Option<String>, // Resolved git toplevel + git-dir, for conflict detection
@@ -426,20 +426,12 @@ impl ClaudeSession {
         }
     }
 
-    /// Record current status into the activity sparkline ring buffer.
-    /// Max 15 entries (one per tick, at 2s default = 30s of history).
+    /// Record this tick's CPU% into the activity sparkline ring buffer. CPU is a
+    /// continuous signal, so the bars vary with real load (BACKLOG "Sparklines":
+    /// the old status-level mapping only ever produced 1–2 bar heights, reading as
+    /// binary on/off). Max 15 entries (one per tick, at 2s default = 30s).
     pub fn record_activity(&mut self) {
-        let level = match self.status {
-            SessionStatus::Processing => 7,
-            SessionStatus::Error => 5,
-            SessionStatus::NeedsInput => 4,
-            SessionStatus::JobDone => 3,
-            SessionStatus::WaitingInput => 2,
-            SessionStatus::Unknown => 2,
-            SessionStatus::Idle => 1,
-            SessionStatus::Finished => 0,
-        };
-        self.activity_history.push(level);
+        self.activity_history.push(self.cpu_percent);
         if self.activity_history.len() > 15 {
             self.activity_history.remove(0);
         }
@@ -463,7 +455,10 @@ impl ClaudeSession {
         }
     }
 
-    /// Render the sparkline as unicode block characters.
+    /// Render the activity (CPU%) ring buffer as unicode block characters. Heights
+    /// scale against a 100% ceiling so a bar reflects real load — a multi-core
+    /// spike clamps at full, an idle tick is blank — giving fleet-strip-like
+    /// granularity instead of the old two-state look.
     pub fn format_sparkline(&self) -> String {
         const BLOCKS: &[char] = &[
             ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}',
@@ -474,7 +469,11 @@ impl ClaudeSession {
         }
         self.activity_history
             .iter()
-            .map(|&level| BLOCKS[level.min(8) as usize])
+            .map(|&cpu| {
+                let frac = (cpu / 100.0).clamp(0.0, 1.0);
+                let idx = (frac * (BLOCKS.len() - 1) as f32).round() as usize;
+                BLOCKS[idx.min(BLOCKS.len() - 1)]
+            })
             .collect()
     }
 
@@ -934,6 +933,25 @@ fn subagent_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparkline_scales_cpu_to_block_heights() {
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "s".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+        });
+        assert_eq!(s.format_sparkline(), "-", "empty history is a dash");
+        // 0% blank, 100% full block, 50% somewhere in between — granular, not binary.
+        s.activity_history = vec![0.0, 50.0, 100.0, 150.0];
+        let bars: Vec<char> = s.format_sparkline().chars().collect();
+        assert_eq!(bars.len(), 4);
+        assert_eq!(bars[0], ' ');
+        assert_eq!(bars[2], '\u{2588}', "100% is a full block");
+        assert_eq!(bars[3], '\u{2588}', "over 100% clamps to full");
+        assert!(bars[1] > '\u{2581}' && bars[1] < '\u{2588}', "50% is a mid bar");
+    }
 
     fn make_session() -> ClaudeSession {
         ClaudeSession::from_raw(RawSession {

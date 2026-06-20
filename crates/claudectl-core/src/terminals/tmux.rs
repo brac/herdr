@@ -98,11 +98,24 @@ pub fn join_into_herdr(pane: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Window-scoped pane-border options herdr toggles around the stage. Listed once
+/// so `clear_stage_border` can unset exactly what `set_stage_border` set.
+const STAGE_BORDER_OPTS: &[&str] = &[
+    "pane-border-status",
+    "pane-border-format",
+    "pane-border-lines",
+    "pane-active-border-style",
+    "pane-border-style",
+];
+
 /// Title the staged agent's pane and turn on titled pane borders, so the divider
 /// under herdr reads like herdr's own `-herdr-` (BACKLOG "Claude window border").
 /// Window-scoped tmux options targeting herdr's window — pure composition (§0.1),
 /// best-effort. The agent is the bottom pane, so its top-edge border (the divider)
-/// carries the title; herdr's pane is labelled "herdr" to match.
+/// carries the title; herdr's pane is labelled "herdr" to match. tmux only draws
+/// borders *between* panes, so the outer (left/right/bottom) edges stay at the
+/// terminal edge — we make the divider read as a frame with a heavy line and a
+/// Dracula-purple highlight on the focused pane's border.
 pub fn set_stage_border(agent_pane: &str, title: &str) {
     let Ok(herdr) = std::env::var("TMUX_PANE") else {
         return;
@@ -121,16 +134,37 @@ pub fn set_stage_border(agent_pane: &str, title: &str) {
         "pane-border-format",
         " #{pane_title} ",
     ]);
+    // Heavy line + Dracula border colors (purple = active/focused, comment = idle).
+    run(&["set-option", "-w", "-t", &herdr, "pane-border-lines", "heavy"]);
+    run(&[
+        "set-option",
+        "-w",
+        "-t",
+        &herdr,
+        "pane-active-border-style",
+        "fg=#bd93f9,bold",
+    ]);
+    run(&[
+        "set-option",
+        "-w",
+        "-t",
+        &herdr,
+        "pane-border-style",
+        "fg=#6272a4",
+    ]);
 }
 
-/// Turn titled pane borders back off (nothing staged). Best-effort.
+/// Turn the staged-pane borders back off (nothing staged), unsetting every option
+/// `set_stage_border` set so the window reverts to tmux defaults. Best-effort.
 pub fn clear_stage_border() {
     let Ok(herdr) = std::env::var("TMUX_PANE") else {
         return;
     };
-    let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-w", "-t", &herdr, "pane-border-status", "off"])
-        .output();
+    for opt in STAGE_BORDER_OPTS {
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-w", "-u", "-t", &herdr, opt])
+            .output();
+    }
 }
 
 /// Break `pane` out of herdr's window back to its own background window, so it's

@@ -62,9 +62,13 @@ Can tmux add a border to the claude window just as herdr has it's own window tit
 -herdr-----
 > Resolved by composing tmux (no rendering, §0.1): when an agent is staged, herdr sets
 > `pane-border-status top` + a `#{pane_title}` border-format on its window and titles the agent pane
-> "Claude — <project>" (and its own "herdr"). The agent's top-edge border is the divider under herdr,
-> so it reads like `-herdr-`. Cleared (`pane-border-status off`) when the stage is hidden.
+> "Claude — <project>" (and its own "herdr"), plus a **heavy** border line and Dracula colors
+> (`pane-active-border-style` purple = focused, `pane-border-style` comment = idle). The agent's
+> top-edge border is the divider under herdr, so it reads like `-herdr-`. Options unset on unstage.
 > `terminals::set_stage_title`/`clear_stage_title` → `tmux::set_stage_border`.
+> Note: the **left/right/bottom** edges stay unbordered — they're the terminal's outer edge, where
+> tmux draws nothing, and herdr can't render a box *into* Claude's pane without becoming a terminal
+> emulator (§8). A full 4-sided frame isn't reachable within the design.
 
 ## Feature: Persistent cost - DONE
 A value that reflects the cost over multiple (all) sessions. For the repo collection as a whole and individual projects. 
@@ -177,3 +181,22 @@ The fleet sparkline has all sorts of varitaion. Make the roster sparkline more g
 > discrete status level that only ever produced 1–2 bar heights. `format_sparkline` scales each bar
 > against a 100% ceiling (a multi-core spike clamps to full, idle ticks blank), giving fleet-strip-like
 > granularity. Test `sparkline_scales_cpu_to_block_heights`. (`session.rs`.)
+
+## Bug: Opus 4.8 (and unrecognized models) over-priced ~3×
+Surfaced by the comparable-tool research (`docs/COMPARABLES.md`, 2026-06-20). `models.rs::shorten_model`
+collapses any `…opus-4-8…` (or 4.5/4.7) to `"opus"`, which resolves to the `opus-4.6` profile = $15/$75
+per M. Real Opus 4.8 is ~$5/$25 per M. Every model that isn't opus/sonnet/haiku also lands on the Opus
+fallback profile, over-counting cost. herdr is the binary you run *on* Opus 4.8 and it mis-costs itself.
+> Fix: replace the tiny `models.rs` table with ccusage's per-model Claude table
+> (`../ccusage/rust/crates/ccusage/src/pricing.rs:564+`, already includes `claude-opus-4-8`) and swap
+> `shorten_model` for its boundary/version-aware model-name matcher (`pricing.rs:363-455`). See
+> `docs/COMPARABLES.md §1` + `§7` item 1.
+
+## Bug: Token over-count from streaming-duplicate JSONL lines
+Surfaced by the same research. Claude Code writes the *same* assistant message's `usage` on multiple
+physical JSONL lines during streaming; herdr accumulates every usage line (no dedup), so multi-line
+turns inflate token + cost totals. Both ccusage (`mod.rs:292`) and tokscale (`claudecode.rs:498`)
+document and handle this.
+> Fix: dedup by `(message.id, requestId)` with per-field **max-merge** (keep the most-complete counts),
+> per tokscale `../tokscale/crates/tokscale-core/src/sessions/claudecode.rs:498`. While there, consider
+> `CostMode::Auto` (trust transcript `costUSD` when present). See `docs/COMPARABLES.md §1`/`§5` + `§7` item 2.

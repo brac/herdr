@@ -20,6 +20,12 @@ as-built record (every phase logged there). Workspace: `crates/claudectl-core` (
 - **Status / CPU / cost inference** — `core/monitor.rs::infer_status` + `core/process.rs` (CPU is
   *instantaneous*, derived from `ps time=` deltas — NOT `%cpu`). The bug-prone heart of herdr; read the
   **`herdr-status`** skill before touching it, and debug live with `HERDR_LOG=/path`.
+- **Token pricing / cost / dedup** — `core/models.rs` (family-prefix pricing table + matcher),
+  `core/monitor.rs::merge_usage` (streaming-duplicate dedup, keyed `message.id:requestId`),
+  `core/history.rs` (CSV + daily activity heatmap for `tui/ui/fleet.rs`). Read the **`herdr-cost`** skill.
+- **Inbound hooks (opt-in)** — `core/hookstate.rs` + `src/hookcmd.rs` (`herdr hook install/notify`).
+  A Notification/Stop hook writes `~/.claude/herdr/<session>.json`; the watcher + `monitor::apply_hook_override`
+  make NeedsInput a fact. Read the **`herdr-hooks`** skill. Distinct from the OUTBOUND `core/hooks.rs`.
 - **Roster render** — `tui/ui/table.rs` (project headers + agents + git glance, plus per-row Context
   bar and Activity sparkline); chat in `tui/ui/chat.rs`; the Phase 4c approval inspector in
   `tui/ui/approval.rs`; the Phase 5 fleet trend strip in `tui/ui/fleet.rs`; `App` owns all state in

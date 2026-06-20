@@ -44,6 +44,12 @@ const CHANNEL_POLL: Duration = Duration::from_millis(200);
 
 fn main() -> io::Result<()> {
     let opts = Options::from_args();
+    // Opt-in file logging: `HERDR_LOG=/path/to/herdr.log herdr`. Off by default
+    // (logger calls are no-ops until init), so it costs nothing in normal use but
+    // gives a status/CPU trace for diagnosing roster state on demand.
+    if let Some(path) = std::env::var_os("HERDR_LOG") {
+        let _ = claudectl_core::logger::init(&path.to_string_lossy());
+    }
     install_panic_restore();
     let mut terminal = enter_tui()?;
     let result = run(&mut terminal, opts);

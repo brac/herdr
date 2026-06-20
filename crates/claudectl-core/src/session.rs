@@ -99,6 +99,13 @@ pub struct ClaudeSession {
     pub status: SessionStatus,
     pub cpu_percent: f32,
     pub cpu_history: Vec<f32>, // Last N CPU readings for smoothing
+    /// Cumulative CPU seconds (`ps time=`) at the previous sample. `ps %cpu` is a
+    /// *lifetime average* (CPU-time ÷ elapsed), so it stays high for ages after an
+    /// agent goes idle — useless as a live "busy?" signal. We derive instantaneous
+    /// CPU% from the delta of this counter over wall-clock between ticks instead.
+    pub prev_cpu_secs: Option<f64>,
+    /// Wall-clock (ms since epoch) when `prev_cpu_secs` was sampled.
+    pub prev_cpu_sample_ms: u64,
     pub mem_mb: f64,
     pub own_input_tokens: u64,
     pub own_output_tokens: u64,
@@ -334,6 +341,8 @@ impl ClaudeSession {
             status: SessionStatus::Idle,
             cpu_percent: 0.0,
             cpu_history: Vec::new(),
+            prev_cpu_secs: None,
+            prev_cpu_sample_ms: 0,
             mem_mb: 0.0,
             own_input_tokens: 0,
             own_output_tokens: 0,

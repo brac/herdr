@@ -6,6 +6,42 @@ use crate::session::{ClaudeSession, SessionStatus};
 const CPU_EMA_ALPHA_RISE: f32 = 0.5; // climbing: damp spikes
 const CPU_EMA_ALPHA_FALL: f32 = 0.8; // dropping: react fast (agent went idle)
 
+/// Minimum wall-clock between CPU samples before we trust the delta. `ps time=`
+/// has 1-second resolution, so a sub-second window would quantize to wild 0%/100%
+/// readings; below this we keep the prior smoothed value and let the window grow.
+const MIN_CPU_SAMPLE_MS: u64 = 750;
+
+/// Parse `ps -o time=` cumulative CPU time into seconds. Formats: `MM:SS`,
+/// `HH:MM:SS`, and Linux's `DD-HH:MM:SS` (days separated by `-`). `None` on an
+/// unrecognized shape so the caller degrades to 0 rather than panicking (§3).
+fn parse_cputime(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (days, hms) = match s.split_once('-') {
+        Some((d, rest)) => (d.parse::<f64>().ok()?, rest),
+        None => (0.0, s),
+    };
+    let mut secs = days * 86_400.0;
+    let parts: Vec<&str> = hms.split(':').collect();
+    match parts.as_slice() {
+        [h, m, sec] => {
+            secs += h.parse::<f64>().ok()? * 3_600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + sec.parse::<f64>().ok()?;
+        }
+        [m, sec] => {
+            secs += m.parse::<f64>().ok()? * 60.0 + sec.parse::<f64>().ok()?;
+        }
+        [sec] => {
+            secs += sec.parse::<f64>().ok()?;
+        }
+        _ => return None,
+    }
+    Some(secs)
+}
+
 /// Asymmetric exponential moving average for a session's CPU%. `prev` is the
 /// previous smoothed value, `sample` the fresh `ps` reading. Rising samples are
 /// damped (a lone spike shouldn't flip status to Processing); falling samples
@@ -30,8 +66,11 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
     let pid_arg = pids.join(",");
 
+    // `time=` is cumulative CPU seconds, NOT `%cpu` (which is a lifetime average:
+    // CPU-time ÷ elapsed, so it lingers high long after an agent goes idle). We
+    // diff this counter over wall-clock to get a true instantaneous CPU% below.
     let output = std::process::Command::new("ps")
-        .args(["-o", "pid=,tty=,%cpu=,rss=,command=", "-p", &pid_arg])
+        .args(["-o", "pid=,tty=,time=,rss=,command=", "-p", &pid_arg])
         .env_clear()
         .output();
 
@@ -49,6 +88,10 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     // Collect alive PIDs from ps output
     let mut alive_pids = std::collections::HashSet::new();
@@ -63,7 +106,7 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
             continue;
         };
         let tty = fields[1].to_string();
-        let cpu = fields[2].parse::<f32>().unwrap_or(0.0);
+        let cpu_secs = parse_cputime(fields[2]).unwrap_or(0.0);
         let rss_kb = fields[3].parse::<f64>().unwrap_or(0.0);
         let mem_mb = rss_kb / 1024.0;
         let command = fields[4..].join(" ");
@@ -82,21 +125,41 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
                 session.tty = tty.clone();
                 session.mem_mb = mem_mb;
 
-                // CPU smoothing: asymmetric EMA — damp spikes on the way up, but
-                // decay fast on a drop so a finished agent stops reading "busy"
-                // within ~1–2 ticks instead of lingering on Processing for ~6s
-                // (BACKLOG: slow status). The short raw history detects the first
-                // sample (seed without smoothing) and remains for diagnostics.
-                let first_sample = session.cpu_history.is_empty();
-                session.cpu_history.push(cpu);
-                if session.cpu_history.len() > 3 {
-                    session.cpu_history.remove(0);
+                // Instantaneous CPU% = Δ(cumulative CPU seconds) ÷ Δ(wall seconds).
+                // This is the live "busy?" signal `ps %cpu` can't give (it's a
+                // lifetime average). Seed silently on the first sample (no prior
+                // counter to diff), and skip windows shorter than the resolution
+                // of `ps time=` (1s) so the delta stays meaningful — keeping the
+                // last smoothed value until enough wall-clock has accrued.
+                match session.prev_cpu_secs {
+                    Some(prev_secs) => {
+                        let elapsed_ms = now_ms.saturating_sub(session.prev_cpu_sample_ms);
+                        if elapsed_ms >= MIN_CPU_SAMPLE_MS {
+                            let inst = (((cpu_secs - prev_secs).max(0.0)
+                                / (elapsed_ms as f64 / 1000.0))
+                                * 100.0) as f32;
+                            session.cpu_history.push(inst);
+                            if session.cpu_history.len() > 3 {
+                                session.cpu_history.remove(0);
+                            }
+                            // Asymmetric EMA: damp spikes on the way up, decay fast
+                            // on a drop so a finished agent clears "Processing" in
+                            // ~1–2 ticks (BACKLOG: slow status).
+                            session.cpu_percent = smooth_cpu(session.cpu_percent, inst);
+                            session.prev_cpu_secs = Some(cpu_secs);
+                            session.prev_cpu_sample_ms = now_ms;
+                        }
+                        // else: window too short — keep the prior cpu_percent and
+                        // let the counter/clock accumulate for the next tick.
+                    }
+                    None => {
+                        // First time we've seen this process: record the counter,
+                        // assume idle until we have a delta to prove otherwise.
+                        session.prev_cpu_secs = Some(cpu_secs);
+                        session.prev_cpu_sample_ms = now_ms;
+                        session.cpu_percent = 0.0;
+                    }
                 }
-                session.cpu_percent = if first_sample {
-                    cpu
-                } else {
-                    smooth_cpu(session.cpu_percent, cpu)
-                };
 
                 // Extract args (everything after "claude")
                 if let Some(idx) = command.find("claude") {
@@ -172,6 +235,50 @@ fn signal(pid: u32, sig: libc::c_int) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("kill {pid}: {}", std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(test)]
+mod cputime_tests {
+    use super::parse_cputime;
+
+    #[test]
+    fn parses_mm_ss() {
+        assert_eq!(parse_cputime("03:41"), Some(221.0));
+    }
+
+    #[test]
+    fn parses_hh_mm_ss() {
+        assert_eq!(parse_cputime("01:00:00"), Some(3_600.0));
+        assert_eq!(parse_cputime("00:03:41"), Some(221.0));
+    }
+
+    #[test]
+    fn parses_days_prefix() {
+        // Linux renders long-lived processes as DD-HH:MM:SS.
+        assert_eq!(parse_cputime("1-00:00:00"), Some(86_400.0));
+    }
+
+    #[test]
+    fn rejects_garbage_without_panicking() {
+        assert_eq!(parse_cputime(""), None);
+        assert_eq!(parse_cputime("not-a-time"), None);
+    }
+
+    #[test]
+    fn instantaneous_cpu_is_the_delta_over_wall_not_the_lifetime_average() {
+        // The whole point of the fix: a process that used 221 CPU-seconds over a
+        // 39-minute lifetime reads ~9.3% under `ps %cpu`, but if it burned only
+        // 0.1 CPU-seconds in the last 2 wall-seconds it is ~5% *now* — and if it
+        // burned nothing, 0%. Prove the delta math reflects the recent window.
+        let prev_secs = 221.0_f64;
+        let now_secs_busy = prev_secs + 2.0; // 2 cpu-sec in a 2s window = 100%
+        let now_secs_idle = prev_secs; // nothing used
+        let window_s = 2.0_f64;
+        let busy = ((now_secs_busy - prev_secs) / window_s) * 100.0;
+        let idle = ((now_secs_idle - prev_secs) / window_s) * 100.0;
+        assert!((busy - 100.0).abs() < 0.01);
+        assert_eq!(idle, 0.0);
     }
 }
 

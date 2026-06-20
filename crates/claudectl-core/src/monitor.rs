@@ -331,7 +331,38 @@ fn finalize_usage(
     session.is_waiting_for_task = is_waiting_for_task;
 
     infer_status(session, last_type, last_stop_reason, is_waiting_for_task);
+
+    // Status diagnostics (no-op unless HERDR_LOG is set; see logger::init). The
+    // signals here are exactly what infer_status branched on, so a stuck status
+    // is readable straight from the log.
+    crate::logger::log(
+        "DEBUG",
+        &format!(
+            "status pid={} -> {:?} | cpu={:.1}% msg_type={} stop={} waiting_for_task={}",
+            session.pid,
+            session.status,
+            session.cpu_percent,
+            if last_type.is_empty() { "-" } else { last_type },
+            if last_stop_reason.is_empty() {
+                "-"
+            } else {
+                last_stop_reason
+            },
+            is_waiting_for_task,
+        ),
+    );
 }
+
+/// How long (minutes) a finished session sits before the roster calls it Idle
+/// rather than just Waiting. Shared by the end_turn and user/tool_result paths.
+const IDLE_AFTER_MINS: u64 = 10;
+/// Grace window (seconds) after a `user`/tool_result line during which low CPU
+/// still reads as Processing — covers the brief plan-the-next-tool gap between a
+/// tool result landing and the model's next streamed message. Past this, low CPU
+/// at a user line means the turn is over (Claude Code agents routinely end a turn
+/// on a tool call, parking the transcript at a tool_result) → Waiting, not a
+/// permanent false Processing.
+const USER_LINE_PROCESSING_GRACE_SECS: u64 = 10;
 
 pub fn infer_status(
     session: &mut ClaudeSession,
@@ -366,7 +397,7 @@ pub fn infer_status(
             .as_millis() as u64;
         let age_mins = (now_ms.saturating_sub(session.last_message_ts)) / 60_000;
 
-        if age_mins > 10 {
+        if age_mins > IDLE_AFTER_MINS {
             session.status = SessionStatus::Idle;
         } else {
             session.status = SessionStatus::WaitingInput;
@@ -405,12 +436,30 @@ pub fn infer_status(
     }
 
     if last_msg_type == "user" {
-        // User sent a message, Claude hasn't finished responding
-        if session.cpu_percent > 1.0 {
+        // The last transcript line is a user/tool_result message, so Claude owes
+        // a response. Distinguish "actively generating" from "turn's over": the
+        // top-of-function `cpu > 5` check already claimed active streaming, so by
+        // here CPU is low. Two sub-cases remain:
+        //   - fresh (within the grace window): the model is between a tool result
+        //     and its next streamed message → Processing.
+        //   - aged out: a Claude Code agent routinely ENDS a turn on a tool call,
+        //     leaving the transcript parked at a tool_result while it waits for
+        //     the next human prompt. Without an age check this branch reported
+        //     Processing forever (the "stuck Processing at $0/hr" bug). Treat it
+        //     like a finished turn: Waiting, then Idle after a long gap.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let age_ms = now_ms.saturating_sub(session.last_message_ts);
+        let age_secs = age_ms / 1000;
+
+        if session.cpu_percent > 1.0 || age_secs < USER_LINE_PROCESSING_GRACE_SECS {
             session.status = SessionStatus::Processing;
+        } else if age_ms / 60_000 > IDLE_AFTER_MINS {
+            session.status = SessionStatus::Idle;
         } else {
-            // Low CPU + user message pending — might be waiting for API or stalled
-            session.status = SessionStatus::Processing;
+            session.status = SessionStatus::WaitingInput;
         }
         return;
     }
@@ -619,10 +668,71 @@ fn estimate_cost_components(
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize_tool, update_tokens};
-    use crate::session::{ClaudeSession, RawSession};
+    use super::{infer_status, summarize_tool, update_tokens};
+    use crate::session::{ClaudeSession, RawSession, SessionStatus};
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn idle_session() -> ClaudeSession {
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "x".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+        });
+        s.telemetry_status = crate::session::TelemetryStatus::Available;
+        s
+    }
+
+    #[test]
+    fn aged_user_tool_result_with_no_cpu_reads_as_waiting_not_processing() {
+        // Regression: a Claude Code agent routinely ends a turn on a tool call,
+        // so the transcript parks at a `user`/tool_result line. Once CPU drops and
+        // the grace window passes, that must read as Waiting — not the old
+        // permanent "Processing at $0/hr".
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.last_message_ts = now_ms().saturating_sub(60_000); // 60s ago
+        infer_status(&mut s, "user", "", false);
+        assert_eq!(s.status, SessionStatus::WaitingInput);
+    }
+
+    #[test]
+    fn fresh_user_tool_result_still_reads_as_processing() {
+        // Within the grace window the model is just between a tool result and its
+        // next streamed message — keep calling that Processing.
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.last_message_ts = now_ms(); // just now
+        infer_status(&mut s, "user", "", false);
+        assert_eq!(s.status, SessionStatus::Processing);
+    }
+
+    #[test]
+    fn busy_user_tool_result_reads_as_processing_regardless_of_age() {
+        // Genuine CPU usage at a user line means it's working, even if old.
+        let mut s = idle_session();
+        s.cpu_percent = 12.0;
+        s.last_message_ts = now_ms().saturating_sub(120_000);
+        infer_status(&mut s, "user", "", false);
+        assert_eq!(s.status, SessionStatus::Processing);
+    }
+
+    #[test]
+    fn long_parked_user_tool_result_reads_as_idle() {
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.last_message_ts = now_ms().saturating_sub(20 * 60_000); // 20 min ago
+        infer_status(&mut s, "user", "", false);
+        assert_eq!(s.status, SessionStatus::Idle);
+    }
 
     #[test]
     fn update_tokens_retains_conversation_from_transcript() {

@@ -1,5 +1,25 @@
 use crate::session::{ClaudeSession, SessionStatus};
 
+/// CPU-signal smoothing (this drives status inference). Asymmetric so a finished
+/// agent stops reading "busy" quickly while transient spikes are still damped.
+/// These are the knobs to tune live if status feels too eager or too laggy.
+const CPU_EMA_ALPHA_RISE: f32 = 0.5; // climbing: damp spikes
+const CPU_EMA_ALPHA_FALL: f32 = 0.8; // dropping: react fast (agent went idle)
+
+/// Asymmetric exponential moving average for a session's CPU%. `prev` is the
+/// previous smoothed value, `sample` the fresh `ps` reading. Rising samples are
+/// damped (a lone spike shouldn't flip status to Processing); falling samples
+/// decay quickly so "Processing" clears within ~1–2 ticks of the work finishing,
+/// instead of the ~6s the old 3-sample mean took (BACKLOG: slow status/activity).
+fn smooth_cpu(prev: f32, sample: f32) -> f32 {
+    let alpha = if sample >= prev {
+        CPU_EMA_ALPHA_RISE
+    } else {
+        CPU_EMA_ALPHA_FALL
+    };
+    alpha * sample + (1.0 - alpha) * prev
+}
+
 /// Check which PIDs are alive and fetch TTY, CPU%, MEM, command args — all via `ps`.
 /// No sysinfo dependency needed.
 pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
@@ -62,13 +82,21 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
                 session.tty = tty.clone();
                 session.mem_mb = mem_mb;
 
-                // CPU smoothing: track last 3 readings, use average
+                // CPU smoothing: asymmetric EMA — damp spikes on the way up, but
+                // decay fast on a drop so a finished agent stops reading "busy"
+                // within ~1–2 ticks instead of lingering on Processing for ~6s
+                // (BACKLOG: slow status). The short raw history detects the first
+                // sample (seed without smoothing) and remains for diagnostics.
+                let first_sample = session.cpu_history.is_empty();
                 session.cpu_history.push(cpu);
                 if session.cpu_history.len() > 3 {
                     session.cpu_history.remove(0);
                 }
-                session.cpu_percent =
-                    session.cpu_history.iter().sum::<f32>() / session.cpu_history.len() as f32;
+                session.cpu_percent = if first_sample {
+                    cpu
+                } else {
+                    smooth_cpu(session.cpu_percent, cpu)
+                };
 
                 // Extract args (everything after "claude")
                 if let Some(idx) = command.find("claude") {
@@ -144,6 +172,43 @@ fn signal(pid: u32, sig: libc::c_int) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("kill {pid}: {}", std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(test)]
+mod smoothing_tests {
+    use super::smooth_cpu;
+
+    #[test]
+    fn damps_a_rising_spike() {
+        // On the way up a lone high reading isn't taken at face value.
+        let v = smooth_cpu(0.0, 80.0);
+        assert!(v > 0.0 && v < 80.0, "rise is damped, got {v}");
+        assert!((v - 40.0).abs() < 0.01, "rise uses the rise alpha (0.5), got {v}");
+    }
+
+    #[test]
+    fn stays_responsive_enough_to_show_processing() {
+        // Even damped, a busy agent must clear the Processing threshold (>5%) at once.
+        assert!(smooth_cpu(0.0, 80.0) > 5.0);
+    }
+
+    #[test]
+    fn decays_fast_when_the_agent_goes_idle() {
+        // BACKLOG slow-status: busy → idle must clear the Processing threshold (5%)
+        // within ~2 ticks instead of lingering ~6s like the old 3-sample mean.
+        let t1 = smooth_cpu(80.0, 0.0);
+        let t2 = smooth_cpu(t1, 0.0);
+        assert!(t1 < 80.0, "decaying, got {t1}");
+        assert!(t2 < 5.0, "clears Processing within two idle ticks, got {t2}");
+    }
+
+    #[test]
+    fn a_single_mid_task_dip_does_not_flip_status() {
+        // One idle sample between bursts keeps a busy agent above the threshold,
+        // so status doesn't flicker out of Processing mid-task.
+        let after_dip = smooth_cpu(40.0, 0.0);
+        assert!(after_dip > 5.0, "one dip keeps it busy, got {after_dip}");
     }
 }
 

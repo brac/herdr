@@ -241,6 +241,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
+                // Same at-a-glance cue for API/tool errors: flag a project hosting any
+                // errored agent so it stands out while scanning (mirrors the ⚠ badge).
+                let error_count = group
+                    .pids
+                    .iter()
+                    .filter(|pid| {
+                        app.sessions
+                            .iter()
+                            .any(|s| s.pid == **pid && s.status == SessionStatus::Error)
+                    })
+                    .count();
+                if error_count > 0 {
+                    header_spans.push(Span::styled(
+                        format!("  \u{2715}{error_count}"),
+                        Style::default().fg(t.status_error).add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if let Some(git) = &group.git {
                     header_spans.push(Span::styled(
                         format!("  {}", git.branch),

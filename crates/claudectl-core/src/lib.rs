@@ -20,6 +20,7 @@ pub mod health;
 pub mod helpers;
 pub mod history;
 pub mod hooks;
+pub mod hookstate;
 pub mod launch;
 pub mod logger;
 pub mod models;

@@ -17,6 +17,12 @@ pub fn projects_dir() -> PathBuf {
     dirs_home().join(".claude").join("projects")
 }
 
+/// Where the opt-in inbound-hook channel writes per-session status files
+/// (`~/.claude/herdr/<session_id>.json`). See `crate::hookstate`.
+pub fn herdr_state_dir() -> PathBuf {
+    dirs_home().join(".claude").join("herdr")
+}
+
 pub fn scan_sessions() -> Vec<ClaudeSession> {
     let dir = sessions_dir();
     cleanup_stale_sessions(&dir);
@@ -56,7 +62,17 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
         };
 
         // JSONL path resolved later by resolve_jsonl_paths() after command_args are populated
-        sessions.push(ClaudeSession::from_raw(raw));
+        let mut session = ClaudeSession::from_raw(raw);
+        // Claude Code stamps an auto-generated task `name` into the same marker; lift
+        // it for display (defensive — older/partial markers may omit it).
+        session.cc_name = serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("name"))
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        sessions.push(session);
     }
 
     sessions

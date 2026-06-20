@@ -154,6 +154,94 @@ fn is_leap(y: u64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
+/// Days the activity heatmap spans — two weeks fits the one-line fleet strip.
+pub const ACTIVITY_DAYS: usize = 14;
+
+/// Per-day total cost for the last `days` days, oldest→newest, zero-filled for days
+/// with no sessions. Buckets by UTC day (`epoch/86400`) — approximate but consistent,
+/// and plenty for a glance heatmap.
+pub fn daily_cost_series(days: usize) -> Vec<f64> {
+    if days == 0 {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let today = now / 86_400;
+    let mut series = vec![0.0; days];
+    for r in load_history(Some(days as u64 * 86_400)) {
+        let Some(secs) = parse_timestamp_epoch(&r.timestamp) else {
+            continue;
+        };
+        let day = secs / 86_400;
+        if day > today {
+            continue;
+        }
+        let back = (today - day) as usize; // 0 = today
+        if back < days {
+            series[days - 1 - back] += r.cost_usd;
+        }
+    }
+    series
+}
+
+/// Bucket a per-day series into 5 intensity levels (`0..=4`) by ratio to the busiest
+/// day — the GitHub-contributions shading, vendored from tokscale's
+/// `calculate_intensities`: ≥0.75→4, ≥0.5→3, ≥0.25→2, >0→1, else 0.
+pub fn intensities(series: &[f64]) -> Vec<u8> {
+    let max = series.iter().cloned().fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return vec![0; series.len()];
+    }
+    series
+        .iter()
+        .map(|&v| {
+            let r = v / max;
+            if r >= 0.75 {
+                4
+            } else if r >= 0.5 {
+                3
+            } else if r >= 0.25 {
+                2
+            } else if r > 0.0 {
+                1
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// Intensity levels for the last `days` days of cost — the cached input to the fleet
+/// strip's activity heatmap.
+pub fn daily_activity(days: usize) -> Vec<u8> {
+    intensities(&daily_cost_series(days))
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn intensities_bucket_by_ratio_to_busiest_day() {
+        // max = 10: 0→0, 1/10=.1→1, 5/10=.5→3, 10/10=1→4.
+        assert_eq!(intensities(&[0.0, 1.0, 5.0, 10.0]), vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn intensities_all_zero_is_all_level_zero() {
+        assert_eq!(intensities(&[0.0, 0.0, 0.0]), vec![0, 0, 0]);
+        assert!(intensities(&[]).is_empty());
+    }
+
+    #[test]
+    fn daily_cost_series_length_matches_window() {
+        assert_eq!(daily_cost_series(14).len(), 14);
+        assert!(daily_cost_series(0).is_empty());
+    }
+}
+
 /// Print a tabular history view.
 pub fn print_history(since: &str) {
     let since_secs = parse_duration(since);

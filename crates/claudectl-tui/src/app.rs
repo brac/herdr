@@ -456,6 +456,10 @@ pub struct App {
     /// All-time persistent cost/tokens (collection-wide + per project), refreshed
     /// on the same cadence as `weekly_summary`.
     pub all_time_summary: claudectl_core::history::AllTimeSummary,
+    /// Per-day activity intensity (0..=4) for the last `ACTIVITY_DAYS`, oldest→newest.
+    /// Drives the fleet strip's heatmap; refreshed on the `weekly_summary` cadence so
+    /// it never reads `history.csv` on the render path (Phase D / docs/COMPARABLES §7).
+    pub daily_activity: Vec<u8>,
     pub weekly_summary_tick: u32, // Refresh every N ticks
     pub hooks: HookRegistry,
     pub daily_limit: Option<f64>,
@@ -772,6 +776,9 @@ impl App {
             theme: Theme::from_mode(claudectl_core::theme::ThemeMode::Dark),
             weekly_summary: claudectl_core::history::weekly_summary(),
             all_time_summary: claudectl_core::history::all_time_summary(),
+            daily_activity: claudectl_core::history::daily_activity(
+                claudectl_core::history::ACTIVITY_DAYS,
+            ),
             weekly_summary_tick: 0,
             hooks: HookRegistry::new(),
             daily_limit: None,
@@ -1778,6 +1785,8 @@ impl App {
             self.weekly_summary_tick = 0;
             self.weekly_summary = claudectl_core::history::weekly_summary();
             self.all_time_summary = claudectl_core::history::all_time_summary();
+            self.daily_activity =
+                claudectl_core::history::daily_activity(claudectl_core::history::ACTIVITY_DAYS);
             self.check_aggregate_budgets();
         }
 
@@ -2998,6 +3007,28 @@ impl App {
                 self.cancel_pending_auto_approve();
                 self.cycle_status_filter();
             }
+            // Status filter quick-keys (agent-deck): jump straight to one filter
+            // instead of cycling with `f`; press the same key again to clear.
+            (KeyCode::Char('!'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.set_status_filter(StatusFilter::NeedsInput);
+            }
+            (KeyCode::Char('@'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.set_status_filter(StatusFilter::Processing);
+            }
+            (KeyCode::Char('#'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.set_status_filter(StatusFilter::WaitingInput);
+            }
+            (KeyCode::Char('$'), _) => {
+                self.cancel_pending_kill();
+                self.cancel_pending_auto_approve();
+                self.set_status_filter(StatusFilter::Idle);
+            }
             (KeyCode::Char('v'), _) => {
                 self.cancel_pending_kill();
                 self.cancel_pending_auto_approve();
@@ -3297,6 +3328,18 @@ impl App {
 
     pub fn cycle_status_filter(&mut self) {
         self.status_filter = self.status_filter.next();
+        self.normalize_selection();
+        self.status_msg = format!("Status filter: {}", self.status_filter.label());
+    }
+
+    /// Jump straight to a status filter (the `!@#$` quick-keys). Pressing the same
+    /// filter again toggles back to `All`, so a quick-key is a clean on/off.
+    pub fn set_status_filter(&mut self, filter: StatusFilter) {
+        self.status_filter = if self.status_filter == filter {
+            StatusFilter::All
+        } else {
+            filter
+        };
         self.normalize_selection();
         self.status_msg = format!("Status filter: {}", self.status_filter.label());
     }
@@ -4513,6 +4556,20 @@ mod tests {
         // …and re-anchored back onto the same agent.
         assert_eq!(app.selection_key(), key);
         assert_eq!(app.selected_session().map(|s| s.pid), Some(11));
+    }
+
+    #[test]
+    fn status_quick_key_sets_then_toggles_back_to_all() {
+        let mut app = make_test_app();
+        assert_eq!(app.status_filter, StatusFilter::All);
+        app.set_status_filter(StatusFilter::NeedsInput);
+        assert_eq!(app.status_filter, StatusFilter::NeedsInput);
+        // Same quick-key again clears it (clean on/off).
+        app.set_status_filter(StatusFilter::NeedsInput);
+        assert_eq!(app.status_filter, StatusFilter::All);
+        // A different quick-key switches directly.
+        app.set_status_filter(StatusFilter::Processing);
+        assert_eq!(app.status_filter, StatusFilter::Processing);
     }
 
     /// Build an app whose grouped roster is deterministic: one active project

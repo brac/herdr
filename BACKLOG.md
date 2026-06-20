@@ -182,21 +182,121 @@ The fleet sparkline has all sorts of varitaion. Make the roster sparkline more g
 > against a 100% ceiling (a multi-core spike clamps to full, idle ticks blank), giving fleet-strip-like
 > granularity. Test `sparkline_scales_cpu_to_block_heights`. (`session.rs`.)
 
-## Bug: Opus 4.8 (and unrecognized models) over-priced ~3×
+## Bug: Opus 4.8 (and unrecognized models) over-priced ~3× - DONE
 Surfaced by the comparable-tool research (`docs/COMPARABLES.md`, 2026-06-20). `models.rs::shorten_model`
 collapses any `…opus-4-8…` (or 4.5/4.7) to `"opus"`, which resolves to the `opus-4.6` profile = $15/$75
 per M. Real Opus 4.8 is ~$5/$25 per M. Every model that isn't opus/sonnet/haiku also lands on the Opus
 fallback profile, over-counting cost. herdr is the binary you run *on* Opus 4.8 and it mis-costs itself.
-> Fix: replace the tiny `models.rs` table with ccusage's per-model Claude table
-> (`../ccusage/rust/crates/ccusage/src/pricing.rs:564+`, already includes `claude-opus-4-8`) and swap
-> `shorten_model` for its boundary/version-aware model-name matcher (`pricing.rs:363-455`). See
-> `docs/COMPARABLES.md §1` + `§7` item 1.
+> Resolved: rewrote `built_in_profile` to current Anthropic list pricing (Opus 4.5–4.8 $5/$25, Sonnet
+> 4–4.6 $3/$15, Haiku 4.5 $1/$5; cache read 0.1× / 5m write 1.25× input — verified against the
+> `claude-api` reference), matched by model **family prefix** so every version/date/`[1m]` suffix
+> resolves. Replaced `shorten_model`'s opus-only special-case with a boundary/version-aware matcher
+> (`family-major.minor`, split on non-alphanumerics so date stamps and `[1m]` don't confuse it). The
+> fallback now prices at mid-tier (Sonnet) not Opus, still flagged `cost_estimate_unverified`. Tests
+> `opus_48_priced_at_current_rate_not_legacy`, `shorten_model_extracts_family_and_version` (`models.rs`).
 
-## Bug: Token over-count from streaming-duplicate JSONL lines
+## Bug: Token over-count from streaming-duplicate JSONL lines - DONE
 Surfaced by the same research. Claude Code writes the *same* assistant message's `usage` on multiple
 physical JSONL lines during streaming; herdr accumulates every usage line (no dedup), so multi-line
 turns inflate token + cost totals. Both ccusage (`mod.rs:292`) and tokscale (`claudecode.rs:498`)
 document and handle this.
-> Fix: dedup by `(message.id, requestId)` with per-field **max-merge** (keep the most-complete counts),
-> per tokscale `../tokscale/crates/tokscale-core/src/sessions/claudecode.rs:498`. While there, consider
-> `CostMode::Auto` (trust transcript `costUSD` when present). See `docs/COMPARABLES.md §1`/`§5` + `§7` item 2.
+> Resolved: `transcript.rs` now captures `message.id` + top-level `requestId`; `monitor.rs` keys each
+> usage line by `(message.id:requestId)` and **max-merges** per tier (`merge_usage`), adding only the
+> increase over any prior emission to the running totals — on both the own-agent and subagent paths.
+> Dedup state persists across incremental ticks (carried by `merge_discovered_session`), resets on
+> `/clear` (fresh session) and on file truncation. Tests `merge_usage_dedups_streaming_duplicates`,
+> `merge_usage_keyless_lines_add_in_full` (`monitor.rs`).
+> Deferred (lower value once the table above is correct): `CostMode::Auto` (trust `costUSD` — present
+> only sporadically in transcripts, and our computed cost now matches it); the 5m/1h cache-creation
+> split (real but ~1.6× on a minor tier); a `>200k` long-context tier (**N/A** — current Opus/Sonnet
+> 1M context is flat-priced, no premium). User-configurable price overrides need a config-file
+> subsystem herdr doesn't have yet (`models::set_overrides` is wired but unused).
+
+## Feature: Inbound permission-prompt hooks (status from fact, not guess) - DONE
+herdr *infers* the invisible permission-prompt NeedsInput state (`<2% CPU + stale tool_use`). Claude
+Code's `Notification` hook fires *exactly* when an agent needs permission/input — make it authoritative.
+(COMPARABLES §7 item 5; whiteroomed from claude-tui's hooks-as-push-signal.)
+> Resolved (Phase B): opt-in, merge-safe. `herdr hook install` merges `Notification`/`Stop` hooks into
+> `~/.claude/settings.json` (idempotent; preserves the user's other hooks; `herdr hook uninstall`
+> reverts). The hook runs `herdr hook notify`, which reads the payload on stdin and atomically writes
+> `~/.claude/herdr/<session_id>.json` (`Notification`→NeedsInput, `Stop`→JobDone). herdr's `notify`
+> watcher now also watches `~/.claude/herdr/`, and `monitor::apply_hook_override` treats a *fresh* status
+> file (newer than the transcript mtime, <5min old) as authoritative — self-clearing once the agent
+> writes new JSONL, so no one has to delete the file. Works without hooks installed (pure no-op).
+> New `core/src/hookstate.rs` + `src/hookcmd.rs`; tests `state_and_settings_under_temp_home`,
+> `read_missing_is_none`; verified end-to-end against a temp HOME. **Usage:** run `herdr hook install`
+> once, then restart Claude Code sessions. Deferred: agent-deck's "acknowledged-downgrades-waiting"
+> (stop nagging once you've attended an agent) — the override already self-clears on the agent's next
+> JSONL line, so this is a minor polish; and stale-file cleanup for dead sessions.
+
+## Feature: Phase C tmux orchestration — INVESTIGATED, mostly N/A for herdr
+COMPARABLES §7 items 6–7 (tmux `-C` control-mode refresh + low-latency send-keys; orphan-pane
+recovery) were borrowed from agent-deck. On investigation against herdr's actual architecture, both
+are obviated — herdr is **not** agent-deck:
+- **Orphan recovery — already covered.** `~/.claude/sessions/<pid>.json` is written by **Claude Code
+  itself** (v2.1.183: `sessionId/cwd/startedAt/status/name/…`), so herdr's `discovery::scan_sessions`
+  already finds *every* running agent — herdr-launched or manual — and maps each to its tmux pane via
+  TTY (`ps` → `pane_for_tty`). agent-deck needs orphan recovery only because it owns named
+  `agentdeck_*` tmux **sessions**; herdr owns none (§0.1/§8) and discovers via a restart-independent
+  registry. No gap.
+- **tmux `-C` control mode — doesn't earn its complexity.** herdr's refresh signal is JSONL writes,
+  caught reliably by the `notify` watcher (transcripts live on the **Linux fs** `~/.claude/projects`,
+  not the flaky `/mnt/c` mount), and herdr sends whole *prompts*, not keystrokes — so neither the
+  `%output` refresh nor the persistent-`send-keys` benefit applies. A persistent `tmux -C` subprocess
+  + protocol parsing would add real complexity (and edge toward §8) for ~zero gain. Skipped per the
+  plan's "commit only if it earns its complexity" gate.
+> Shipped the one real adjacent win the investigation surfaced: herdr parsed *past* Claude Code's
+> session `name` (it read only pid/sessionId/cwd/startedAt). `discovery::scan_sessions` now lifts
+> `name` into a new `ClaudeSession.cc_name`, shown read-only in the **detail view** under Project
+> (e.g. "audit-model-pricing-bugs") so multiple agents in one repo are tellable apart. Kept separate
+> from `display_name()`/`session_name` so it never disturbs history's per-project cost folding.
+> Follow-up (UX decision, not done): promote `cc_name` to the roster agent-row label and the staged-
+> pane border title.
+
+## Feature: Phase D graphs — daily activity heatmap (D1 done; D2/D3 deferred)
+COMPARABLES §7 items 8–10. Applied the plan's own gate ("each graph reflects real data and is
+something we actually glance at; defer any that don't earn the space").
+> Shipped D1 — **daily activity heatmap** on the fleet strip (`G`). New `history::daily_cost_series`
+> + `history::intensities` (the 5-level GitHub-contributions bucketer vendored from tokscale's
+> `calculate_intensities`: ≥0.75→4 … >0→1, else 0) → `history::daily_activity(ACTIVITY_DAYS=14)`.
+> Cached on `App.daily_activity`, refreshed on the `weekly_summary` cadence (~30s) so it never reads
+> `history.csv` on the render path. `ui/fleet.rs` renders one cell per UTC day (`· ░ ▒ ▓ █`, shaded by
+> that day's spend vs. the busiest day) — the "days" time axis the live burn sparkline (~30s) can't
+> show. Tests `intensities_bucket_by_ratio_to_busiest_day`, `daily_cost_series_length_matches_window`,
+> `heatmap_maps_levels_to_shades`. (Populates as sessions complete — same `history.csv` the all-time/
+> weekly totals already use.)
+> Deferred with rationale:
+> - **D2 (P90 personalized limit + 5h-block projection)** — would introduce a 5-hour "block" entity in
+>   tension with the project-first model (CLAUDE.md §2); the plan-limit tables are community guesses;
+>   and the JSONL limit-notice regexes can't be verified without a real "limit reached" sample. Heavy +
+>   speculative for a narrow quota-prediction payoff.
+> - **D3 (turns-until-compaction / wasted-context)** — value dropped sharply with 1M-context models
+>   (auto-compaction is now rare), and the detail view already shows context %/bar. Marginal vs. effort.
+> Follow-up if wanted: a full multi-row GitHub-style heatmap overlay (the `intensities` bucketer is
+> already in place and tested, so it's mostly render plumbing).
+
+## Feature: Phase E roster UX cheap wins (E1 + E2 done; E3 deferred)
+COMPARABLES §7 tail.
+> Shipped:
+> - **E1 — Error badge on project headers.** The header already flags blocked agents (`⚠N`); now it
+>   also flags errored ones with `✕N` (red, `t.status_error`), shown only when a project hosts an
+>   agent in `SessionStatus::Error` — same tasteful, only-when-relevant pattern. (Chose this over the
+>   full per-status count breakdown agent-deck shows on *collapsed* groups: herdr always shows the
+>   agent rows, so a full breakdown is redundant clutter — and the user keeps the roster lean.)
+>   `ui/table.rs`.
+> - **E2 — status filter quick-keys.** `!`=needs-input `@`=processing `#`=waiting `$`=idle jump
+>   straight to a filter (vs. `f` which cycles); pressing the same key again toggles back to All for a
+>   clean on/off (`App::set_status_filter`). Documented in the `?` help overlay. `app.rs`. Test
+>   `status_quick_key_sets_then_toggles_back_to_all`.
+> Deferred: **E3 (freshness `[Nm ago]`)** — herdr's roster is event-driven (notify watcher + 2s
+>   safety tick), so it's near-always fresh; a staleness indicator (valuable for vscode-claude-status's
+>   *network* panel) would read "now" almost always here. Low value.
+
+## Bug: If an anget process Job Done then the fleet count should be idle +1
+what is the difference between idle and waitign anyway? And jobs done? I feel like I am conflating terms
+
+## Feature: README.md
+Please write one for this repo. 
+
+## Bug: Roster Height
+When I am using herdr in a vertical moniter the first thing I want to do after started a new agent is increase the height of the roster bar. It is too small and I want it bigger. Then I notice that I can only get it to a max height, and even if I go to the agent window and try to bring that down with ctrl + b + down arrow it snaps back to this roster max height. Why? I don't want a max height I want a min height for the roster view

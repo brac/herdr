@@ -42,6 +42,14 @@ pub fn spawn(claude_projects: &Path, parent_dir: &Path) -> Option<(Receiver<()>,
     let _ = watcher.watch(claude_projects, RecursiveMode::Recursive);
     let _ = watcher.watch(parent_dir, RecursiveMode::NonRecursive);
 
+    // Phase B: the opt-in inbound Notification/Stop hook writes per-session status
+    // files here. Create the dir so the watch succeeds even before the first hook
+    // fires — otherwise a hook write would wait for the safety-net tick instead of
+    // repainting the roster near-instantly.
+    let herdr_dir = claudectl_core::discovery::herdr_state_dir();
+    let _ = std::fs::create_dir_all(&herdr_dir);
+    let _ = watcher.watch(&herdr_dir, RecursiveMode::NonRecursive);
+
     Some((rx, watcher))
 }
 

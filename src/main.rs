@@ -27,6 +27,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use claudectl_core::discovery;
 use claudectl_tui::{app::App, ui};
 
+mod hookcmd;
 mod watcher;
 
 /// Safety-net refresh cadence. With the Phase 2.5 watcher driving most refreshes
@@ -43,6 +44,14 @@ const TICK_RATE: Duration = Duration::from_secs(2);
 const CHANNEL_POLL: Duration = Duration::from_millis(200);
 
 fn main() -> io::Result<()> {
+    // Phase B: `herdr hook …` is a non-TUI subcommand path — handle it (a hook
+    // payload on stdin, or an install/uninstall of the settings.json hooks) and
+    // exit before touching the terminal. Everything else falls through to the TUI.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("hook") {
+        std::process::exit(hookcmd::run(argv.get(1).map(String::as_str)));
+    }
+
     let opts = Options::from_args();
     // Opt-in file logging: `HERDR_LOG=/path/to/herdr.log herdr`. Off by default
     // (logger calls are no-ops until init), so it costs nothing in normal use but

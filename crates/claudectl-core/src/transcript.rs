@@ -28,6 +28,13 @@ pub struct TranscriptMessage {
     pub stop_reason: Option<String>,
     pub usage: Option<TranscriptUsage>,
     pub content: Vec<TranscriptBlock>,
+    /// `message.id` — Claude streams one assistant message across several physical
+    /// JSONL lines that share this id; used (with `request_id`) to dedup usage so a
+    /// re-emitted line doesn't double-count tokens.
+    pub id: Option<String>,
+    /// Top-level `requestId` on the transcript entry — disambiguates a message id
+    /// replayed under a new request.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +84,14 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
             .map(|s| s.to_string()),
         usage: msg.get("usage").and_then(parse_usage),
         content,
+        id: msg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        request_id: entry
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }))
 }
 

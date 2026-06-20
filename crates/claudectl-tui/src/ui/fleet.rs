@@ -72,7 +72,31 @@ pub fn render_fleet_strip(frame: &mut Frame, area: Rect, app: &App) {
         dim,
     ));
 
+    // Daily activity heatmap (last ACTIVITY_DAYS days): one cell per day, shaded by
+    // that day's spend relative to the busiest day — the "days" time axis the live
+    // burn sparkline (last ~30s) can't show.
+    if !app.daily_activity.is_empty() {
+        spans.push(Span::styled(
+            format!("   \u{2502}  {}d ", app.daily_activity.len()),
+            dim,
+        ));
+        spans.push(Span::styled(
+            heatmap(&app.daily_activity),
+            Style::default().fg(t.sparkline),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Map a per-day intensity series (0..=4) to a heatmap row. Level 0 reads as an empty
+/// day; higher levels shade progressively darker (· ░ ▒ ▓ █).
+fn heatmap(levels: &[u8]) -> String {
+    const CELLS: [char; 5] = ['\u{00b7}', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+    levels
+        .iter()
+        .map(|&l| CELLS[(l as usize).min(CELLS.len() - 1)])
+        .collect()
 }
 
 /// Compact token count for the strip: "1.2M tok" / "450k tok" / "37 tok".
@@ -112,7 +136,15 @@ fn spark(history: &[f64]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_tokens, spark};
+    use super::{fmt_tokens, heatmap, spark};
+
+    #[test]
+    fn heatmap_maps_levels_to_shades() {
+        assert_eq!(heatmap(&[0, 1, 2, 3, 4]), "\u{00b7}\u{2591}\u{2592}\u{2593}\u{2588}");
+        assert_eq!(heatmap(&[]), "");
+        // Out-of-range levels clamp to the darkest cell rather than panicking.
+        assert_eq!(heatmap(&[9]), "\u{2588}");
+    }
 
     #[test]
     fn fmt_tokens_scales_units() {

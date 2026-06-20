@@ -123,6 +123,12 @@ pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &ClaudeSessio
         detail_line("  Estimate", &estimate, t),
     ];
 
+    // Claude Code's own task name for this session, if it stamped one — shown right
+    // under Project so multiple agents in one repo are tellable apart (Phase C).
+    if let Some(name) = &session.cc_name {
+        lines.insert(4, detail_line("Name", name, t));
+    }
+
     // Cognitive Health section
     if session.has_usage_metrics() && session.decay_score > 0 {
         lines.push(Line::from(""));

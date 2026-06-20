@@ -61,6 +61,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("  Cycle status filter"),
         ]),
         Line::from(vec![
+            Span::styled("  ! @ # $        ", Style::default().fg(t.highlight_key)),
+            Span::raw("  Filter: needs-input / processing / waiting / idle (toggle)"),
+        ]),
+        Line::from(vec![
             Span::styled("  v              ", Style::default().fg(t.highlight_key)),
             Span::raw("  Cycle focus filter"),
         ]),

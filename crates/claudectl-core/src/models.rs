@@ -42,24 +42,39 @@ pub struct ResolvedModelProfile {
 
 static MODEL_OVERRIDES: OnceLock<Mutex<HashMap<String, ModelProfile>>> = OnceLock::new();
 
+/// Normalize a raw model id (e.g. `claude-opus-4-8-20260101`, `claude-opus-4-8[1m]`)
+/// to a short `family-major.minor` display key (`opus-4.8`). The family prefix is what
+/// [`built_in_profile`] matches on, so any version/date/`[1m]` suffix still prices
+/// correctly; the version is kept only for display. Unknown families pass through
+/// (lowercased) so config overrides keyed on the full id still resolve.
 pub fn shorten_model(model: &str) -> String {
-    if model.contains("opus") {
-        if model.contains("4-6") {
-            "opus-4.6".into()
-        } else {
-            "opus".into()
-        }
-    } else if model.contains("sonnet") {
-        if model.contains("4-6") {
-            "sonnet-4.6".into()
-        } else {
-            "sonnet".into()
-        }
-    } else if model.contains("haiku") {
-        "haiku".into()
+    let lower = model.trim().to_lowercase();
+    let family = if lower.contains("opus") {
+        "opus"
+    } else if lower.contains("sonnet") {
+        "sonnet"
+    } else if lower.contains("haiku") {
+        "haiku"
     } else {
-        model.to_string()
+        return lower;
+    };
+
+    // Split on every non-alphanumeric boundary so date stamps (`-20260101`) and
+    // bracketed suffixes (`[1m]`) don't confuse the version scan, then take the two
+    // numeric segments immediately after the family word.
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Some(i) = tokens.iter().position(|t| *t == family)
+        && let (Some(maj), Some(min)) = (tokens.get(i + 1), tokens.get(i + 2))
+        && let (Ok(maj), Ok(min)) = (maj.parse::<u32>(), min.parse::<u32>())
+        && maj < 100
+        && min < 100
+    {
+        return format!("{family}-{maj}.{min}");
     }
+    family.to_string()
 }
 
 pub fn set_overrides(overrides: Vec<ModelOverride>) {
@@ -126,39 +141,52 @@ pub(crate) fn resolve_with_overrides(
     }
 }
 
+/// Built-in per-1M-token pricing, matched by model *family* prefix so every version
+/// (4.5/4.6/4.7/4.8, date-stamped, `[1m]`) resolves. Current Anthropic list pricing
+/// (verified against the `claude-api` reference, 2026-06):
+///   Opus 4.5–4.8: $5 in / $25 out · Sonnet 4–4.6: $3 / $15 · Haiku 4.5: $1 / $5
+/// Cache follows the standard formula: read = 0.1× input, 5-minute write = 1.25× input.
+/// (Earlier the table priced `opus` at $15/$75 — old Opus-4.0/4.1 numbers — over-charging
+/// Opus 4.5+ by ~3×; see `docs/COMPARABLES.md`.)
 fn built_in_profile(key: &str) -> Option<ModelProfile> {
-    match key {
-        "opus-4.6" | "opus" => Some(ModelProfile {
-            input_per_m: 15.0,
-            output_per_m: 75.0,
-            cache_read_per_m: 1.875,
-            cache_write_per_m: 18.75,
+    if key.starts_with("opus") {
+        Some(ModelProfile {
+            input_per_m: 5.0,
+            output_per_m: 25.0,
+            cache_read_per_m: 0.5,
+            cache_write_per_m: 6.25,
             context_max: 1_000_000,
-        }),
-        "sonnet-4.6" | "sonnet" => Some(ModelProfile {
+        })
+    } else if key.starts_with("sonnet") {
+        Some(ModelProfile {
             input_per_m: 3.0,
             output_per_m: 15.0,
-            cache_read_per_m: 0.375,
+            cache_read_per_m: 0.30,
             cache_write_per_m: 3.75,
-            context_max: 200_000,
-        }),
-        "haiku" => Some(ModelProfile {
-            input_per_m: 0.80,
-            output_per_m: 4.0,
+            context_max: 1_000_000,
+        })
+    } else if key.starts_with("haiku") {
+        Some(ModelProfile {
+            input_per_m: 1.0,
+            output_per_m: 5.0,
             cache_read_per_m: 0.10,
-            cache_write_per_m: 1.0,
+            cache_write_per_m: 1.25,
             context_max: 200_000,
-        }),
-        _ => None,
+        })
+    } else {
+        None
     }
 }
 
+/// Unknown model: price conservatively at mid-tier (Sonnet) rather than the old Opus
+/// default. Sessions on the fallback are flagged `cost_estimate_unverified` via
+/// [`ModelProfileSource::Fallback`].
 fn fallback_profile() -> ModelProfile {
     ModelProfile {
-        input_per_m: 15.0,
-        output_per_m: 75.0,
-        cache_read_per_m: 1.875,
-        cache_write_per_m: 18.75,
+        input_per_m: 3.0,
+        output_per_m: 15.0,
+        cache_read_per_m: 0.30,
+        cache_write_per_m: 3.75,
         context_max: 200_000,
     }
 }
@@ -197,5 +225,34 @@ mod tests {
         let resolved = resolve_with_overrides("mystery-model", &HashMap::new());
         assert_eq!(resolved.source, ModelProfileSource::Fallback);
         assert_eq!(resolved.profile.context_max, 200_000);
+    }
+
+    #[test]
+    fn opus_48_priced_at_current_rate_not_legacy() {
+        // Regression for the ~3× over-price: Opus 4.5–4.8 is $5/$25, not the old
+        // Opus-4.0/4.1 $15/$75 (docs/COMPARABLES.md).
+        for id in [
+            "claude-opus-4-8",
+            "claude-opus-4-8-20260101",
+            "claude-opus-4-8[1m]",
+            "claude-opus-4-5-20251101",
+        ] {
+            let r = resolve_with_overrides(id, &HashMap::new());
+            assert_eq!(r.source, ModelProfileSource::BuiltIn, "{id}");
+            assert_eq!(r.profile.input_per_m, 5.0, "{id}");
+            assert_eq!(r.profile.output_per_m, 25.0, "{id}");
+        }
+    }
+
+    #[test]
+    fn shorten_model_extracts_family_and_version() {
+        assert_eq!(shorten_model("claude-opus-4-8-20260101"), "opus-4.8");
+        assert_eq!(shorten_model("claude-opus-4-8[1m]"), "opus-4.8");
+        assert_eq!(shorten_model("claude-sonnet-4-6-20260401"), "sonnet-4.6");
+        assert_eq!(shorten_model("claude-haiku-4-5"), "haiku-4.5");
+        // Legacy name-after-version layout: version not adjacent → family only.
+        assert_eq!(shorten_model("claude-3-5-haiku-20241022"), "haiku");
+        // Unknown family passes through (lowercased) so overrides still key on it.
+        assert_eq!(shorten_model("GPT-4o"), "gpt-4o");
     }
 }

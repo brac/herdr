@@ -5,9 +5,55 @@ use serde_json::Value;
 
 use crate::models;
 use crate::session::{
-    ChatKind, ChatRole, ClaudeSession, SessionStatus, SubagentRollup, TelemetryStatus,
+    ChatKind, ChatRole, ClaudeSession, SeenUsage, SessionStatus, SubagentRollup, TelemetryStatus,
 };
-use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
+use crate::transcript::{
+    TranscriptBlock, TranscriptEvent, TranscriptRole, TranscriptUsage, parse_line,
+};
+use std::collections::HashMap;
+
+/// Build the dedup key from a message's id + requestId: `message.id` with `requestId` as
+/// a tiebreaker. Returns `None` when there's no id — such a line can't be deduped and is
+/// counted in full. Takes the fields by ref (not the whole message) so it composes with
+/// the parent loop's partial moves of `stop_reason`/`usage`.
+fn dedup_key(id: Option<&str>, request_id: Option<&str>) -> Option<String> {
+    id.map(|id| match request_id {
+        Some(req) => format!("{id}:{req}"),
+        None => id.to_string(),
+    })
+}
+
+/// Apply streaming-duplicate dedup for one usage line and return the per-tier amounts
+/// to ADD to the running totals: full tokens for a first-seen message, or only the
+/// increase over the previous max for a re-emitted one (keyless lines add in full).
+fn merge_usage(
+    seen: &mut HashMap<String, SeenUsage>,
+    key: Option<&str>,
+    usage: &TranscriptUsage,
+) -> SeenUsage {
+    let Some(key) = key else {
+        return SeenUsage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cache_read_input_tokens,
+            cache_write: usage.cache_creation_input_tokens,
+        };
+    };
+    let entry = seen.entry(key.to_string()).or_default();
+    let delta = SeenUsage {
+        input: usage.input_tokens.saturating_sub(entry.input),
+        output: usage.output_tokens.saturating_sub(entry.output),
+        cache_read: usage.cache_read_input_tokens.saturating_sub(entry.cache_read),
+        cache_write: usage
+            .cache_creation_input_tokens
+            .saturating_sub(entry.cache_write),
+    };
+    entry.input = entry.input.max(usage.input_tokens);
+    entry.output = entry.output.max(usage.output_tokens);
+    entry.cache_read = entry.cache_read.max(usage.cache_read_input_tokens);
+    entry.cache_write = entry.cache_write.max(usage.cache_creation_input_tokens);
+    delta
+}
 
 #[derive(Default)]
 struct UsageRollup {
@@ -67,6 +113,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                     session.own_output_tokens = 0;
                     session.own_cache_read_tokens = 0;
                     session.own_cache_write_tokens = 0;
+                    session.usage_seen.clear();
                     // Reset persisted inference state on file truncation
                     last_type.clear();
                     last_stop_reason.clear();
@@ -143,21 +190,25 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                                     }
                                 }
 
+                                let dedup =
+                                    dedup_key(message.id.as_deref(), message.request_id.as_deref());
                                 if let Some(usage) = message.usage {
-                                    let input = usage.input_tokens;
-                                    let cache_read = usage.cache_read_input_tokens;
-                                    let cache_create = usage.cache_creation_input_tokens;
-                                    let output = usage.output_tokens;
-
-                                    session.own_input_tokens += input + cache_read + cache_create;
-                                    session.own_output_tokens += output;
-                                    session.own_cache_read_tokens += cache_read;
-                                    session.own_cache_write_tokens += cache_create;
+                                    // Streaming-duplicate dedup: add only the increase over
+                                    // any prior emission of this (message.id, requestId).
+                                    let add =
+                                        merge_usage(&mut session.usage_seen, dedup.as_deref(), &usage);
+                                    session.own_input_tokens +=
+                                        add.input + add.cache_read + add.cache_write;
+                                    session.own_output_tokens += add.output;
+                                    session.own_cache_read_tokens += add.cache_read;
+                                    session.own_cache_write_tokens += add.cache_write;
                                     saw_parent_usage = true;
 
-                                    // Track context window: the input_tokens of the LAST API call
-                                    // represents the current prompt/context size
-                                    let context_size = input + cache_read + cache_create;
+                                    // Context window = the LAST API call's actual prompt size
+                                    // (the raw line value, not a dedup delta).
+                                    let context_size = usage.input_tokens
+                                        + usage.cache_read_input_tokens
+                                        + usage.cache_creation_input_tokens;
                                     if context_size > 0 {
                                         session.context_tokens = context_size;
                                     }
@@ -353,6 +404,11 @@ fn finalize_usage(
         last_was_api_error,
     );
 
+    // Phase B: if an opt-in Notification/Stop hook left a fresh status file, let it
+    // override the heuristic — turning the invisible-permission-prompt guess into a
+    // fact. No-op when hooks aren't installed (the file simply doesn't exist).
+    apply_hook_override(session);
+
     // Status diagnostics (no-op unless HERDR_LOG is set; see logger::init). The
     // signals here are exactly what infer_status branched on, so a stuck status
     // is readable straight from the log.
@@ -372,6 +428,60 @@ fn finalize_usage(
             is_waiting_for_task,
         ),
     );
+}
+
+/// Freshness window for an inbound hook status file. Beyond this, treat it as a
+/// leftover from a previous run and ignore it (the agent would have written newer
+/// JSONL by now anyway).
+const HOOK_FRESH_MS: u64 = 5 * 60 * 1000;
+
+/// Apply an opt-in Notification/Stop hook's status file as an authoritative override
+/// of the heuristic — but only while it's the most recent thing that happened. Once
+/// the agent resumes and writes new JSONL, `last_message_ts` (the transcript mtime)
+/// advances past the hook and the heuristic takes back over, so this self-clears
+/// without anyone deleting the file.
+fn apply_hook_override(session: &mut ClaudeSession) {
+    use crate::hookstate::{self, HookStatus};
+
+    let Some(state) = hookstate::read(&session.session_id) else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Stale leftover, or superseded by newer transcript activity (500ms slop: Stop
+    // fires right after the final line is written) → defer to the heuristic.
+    if now_ms.saturating_sub(state.ts_ms) > HOOK_FRESH_MS {
+        return;
+    }
+    if state.ts_ms + 500 < session.last_message_ts {
+        return;
+    }
+
+    match state.status {
+        // A real retry/continuation (Processing) or an active API error outranks a
+        // "needs input" hint; otherwise the hook makes NeedsInput a fact.
+        HookStatus::NeedsInput => {
+            if !matches!(
+                session.status,
+                SessionStatus::Processing | SessionStatus::Error
+            ) {
+                session.status = SessionStatus::NeedsInput;
+            }
+        }
+        // Confirm a finished turn only when the heuristic was ambiguous (idle/waiting/
+        // unknown) — never stomp Processing/NeedsInput/Error.
+        HookStatus::JobDone => {
+            if matches!(
+                session.status,
+                SessionStatus::Idle | SessionStatus::WaitingInput | SessionStatus::Unknown
+            ) {
+                session.status = SessionStatus::JobDone;
+            }
+        }
+    }
 }
 
 /// How long (minutes) a finished session sits before the roster calls it Idle
@@ -641,23 +751,25 @@ fn update_subagent_rollup(
             continue;
         };
 
-        if let Some(model) = message.model {
-            current_model = shorten_model(&model);
+        if let Some(ref model) = message.model {
+            current_model = shorten_model(model);
             rollup.model = current_model.clone();
         }
 
+        let dedup = dedup_key(message.id.as_deref(), message.request_id.as_deref());
         let Some(usage) = message.usage else {
             continue;
         };
 
-        rollup.input_tokens += usage.input_tokens;
-        rollup.output_tokens += usage.output_tokens;
-        rollup.cache_read_tokens += usage.cache_read_input_tokens;
-        rollup.cache_write_tokens += usage.cache_creation_input_tokens;
+        // Same streaming-duplicate dedup as the parent path: account only the increase.
+        let add = merge_usage(&mut rollup.usage_seen, dedup.as_deref(), &usage);
+        rollup.input_tokens += add.input;
+        rollup.output_tokens += add.output;
+        rollup.cache_read_tokens += add.cache_read;
+        rollup.cache_write_tokens += add.cache_write;
         rollup.usage_metrics_available = true;
 
-        let input_with_cache =
-            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+        let input_with_cache = add.input + add.cache_read + add.cache_write;
         let model_for_cost = if current_model.is_empty() {
             default_model
         } else {
@@ -666,9 +778,9 @@ fn update_subagent_rollup(
         let (delta_cost, unverified) = estimate_cost_components(
             model_for_cost,
             input_with_cache,
-            usage.output_tokens,
-            usage.cache_read_input_tokens,
-            usage.cache_creation_input_tokens,
+            add.output,
+            add.cache_read,
+            add.cache_write,
         );
         rollup.cost_usd += delta_cost;
         rollup.cost_estimate_unverified |= unverified;
@@ -712,6 +824,59 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    #[test]
+    fn merge_usage_dedups_streaming_duplicates() {
+        use super::{dedup_key, merge_usage};
+        use crate::session::SeenUsage;
+        use crate::transcript::TranscriptUsage;
+        use std::collections::HashMap;
+
+        let mut seen: HashMap<String, SeenUsage> = HashMap::new();
+        let key = dedup_key(Some("msg_1"), Some("req_1"));
+        assert_eq!(key.as_deref(), Some("msg_1:req_1"));
+
+        let u = TranscriptUsage {
+            input_tokens: 100,
+            cache_read_input_tokens: 50,
+            cache_creation_input_tokens: 10,
+            output_tokens: 20,
+        };
+        // First emission counts in full.
+        let a = merge_usage(&mut seen, key.as_deref(), &u);
+        assert_eq!((a.input, a.cache_read, a.cache_write, a.output), (100, 50, 10, 20));
+        // Identical re-emission (streaming duplicate) adds nothing.
+        let b = merge_usage(&mut seen, key.as_deref(), &u);
+        assert_eq!((b.input, b.cache_read, b.cache_write, b.output), (0, 0, 0, 0));
+        // A grown re-emission adds only the increase.
+        let u2 = TranscriptUsage {
+            output_tokens: 35,
+            ..u
+        };
+        let c = merge_usage(&mut seen, key.as_deref(), &u2);
+        assert_eq!((c.input, c.cache_read, c.cache_write, c.output), (0, 0, 0, 15));
+    }
+
+    #[test]
+    fn merge_usage_keyless_lines_add_in_full() {
+        use super::merge_usage;
+        use crate::session::SeenUsage;
+        use crate::transcript::TranscriptUsage;
+        use std::collections::HashMap;
+
+        let mut seen: HashMap<String, SeenUsage> = HashMap::new();
+        let u = TranscriptUsage {
+            input_tokens: 10,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            output_tokens: 5,
+        };
+        // No id → can't dedup → both lines count.
+        let a = merge_usage(&mut seen, None, &u);
+        let b = merge_usage(&mut seen, None, &u);
+        assert_eq!(a.input + b.input, 20);
+        assert!(seen.is_empty());
     }
 
     fn idle_session() -> ClaudeSession {

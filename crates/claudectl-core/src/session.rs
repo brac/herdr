@@ -118,6 +118,11 @@ pub struct ClaudeSession {
     pub own_output_tokens: u64,
     pub own_cache_read_tokens: u64,
     pub own_cache_write_tokens: u64,
+    /// Streaming-duplicate dedup state for this agent's own transcript, keyed
+    /// `message.id:requestId`. Persists across incremental ticks (carried by
+    /// `merge_discovered_session`); reset on `/clear` (fresh session) and on file
+    /// truncation. See [`SeenUsage`].
+    pub usage_seen: HashMap<String, SeenUsage>,
     pub subagent_input_tokens: u64,
     pub subagent_output_tokens: u64,
     pub subagent_cache_read_tokens: u64,
@@ -127,6 +132,12 @@ pub struct ClaudeSession {
     pub model: String,
     pub command_args: String,
     pub session_name: String,
+    /// Claude Code's own auto-generated session label (the `name` field in
+    /// `~/.claude/sessions/<pid>.json`, e.g. "audit-model-pricing-bugs") — a task
+    /// summary that distinguishes multiple agents in one project. Surfaced read-only
+    /// in the detail view; kept separate from `session_name`/`display_name()` so it
+    /// never affects history's per-project cost folding (which keys on the project).
+    pub cc_name: Option<String>,
     pub jsonl_path: Option<PathBuf>,
     pub jsonl_offset: u64,
     pub last_message_ts: u64,
@@ -242,6 +253,19 @@ pub struct ToolStats {
     pub calls: u32,
 }
 
+/// Per-message running maxima for streaming-duplicate dedup. Claude Code writes one
+/// assistant message's `usage` across several physical JSONL lines as it streams;
+/// keyed by `(message.id, requestId)`, we keep the max seen per tier and add only the
+/// *increase* to the running totals, so a re-emitted line never double-counts
+/// (see `docs/COMPARABLES.md`; the same correction tokscale's parser makes).
+#[derive(Debug, Clone, Default)]
+pub struct SeenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRollup {
     pub jsonl_offset: u64,
@@ -253,6 +277,8 @@ pub struct SubagentRollup {
     pub model: String,
     pub cost_estimate_unverified: bool,
     pub usage_metrics_available: bool,
+    /// Dedup state for this subagent transcript (keyed `message.id:requestId`).
+    pub usage_seen: HashMap<String, SeenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +393,7 @@ impl ClaudeSession {
             own_output_tokens: 0,
             own_cache_read_tokens: 0,
             own_cache_write_tokens: 0,
+            usage_seen: HashMap::new(),
             subagent_input_tokens: 0,
             subagent_output_tokens: 0,
             subagent_cache_read_tokens: 0,
@@ -376,6 +403,7 @@ impl ClaudeSession {
             model: String::new(),
             command_args: String::new(),
             session_name: String::new(),
+            cc_name: None,
             jsonl_path: None,
             jsonl_offset: 0,
             last_message_ts: 0,

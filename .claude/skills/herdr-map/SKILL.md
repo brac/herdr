@@ -17,16 +17,22 @@ as-built record (every phase logged there). Workspace: `crates/claudectl-core` (
 - **JSONL parser** — `core/transcript.rs` (full content: Text/ToolUse/ToolResult) +
   `core/monitor.rs::update_tokens` (incremental seek; also fills `session.conversation` for the chat,
   and detects per-session activity to event-refresh git).
-- **Status inference** — `core/monitor.rs::infer_status` (CPU > stop_reason > age > tool_use).
-- **Roster render** — `tui/ui/table.rs` (project headers + agents + git glance); chat in
-  `tui/ui/chat.rs`; `App` owns all state in `tui/app.rs`.
+- **Status / CPU / cost inference** — `core/monitor.rs::infer_status` + `core/process.rs` (CPU is
+  *instantaneous*, derived from `ps time=` deltas — NOT `%cpu`). The bug-prone heart of herdr; read the
+  **`herdr-status`** skill before touching it, and debug live with `HERDR_LOG=/path`.
+- **Roster render** — `tui/ui/table.rs` (project headers + agents + git glance, plus per-row Context
+  bar and Activity sparkline); chat in `tui/ui/chat.rs`; the Phase 4c approval inspector in
+  `tui/ui/approval.rs`; the Phase 5 fleet trend strip in `tui/ui/fleet.rs`; `App` owns all state in
+  `tui/app.rs`.
 - **Event loop** — `src/main.rs`. Event-driven: a `notify` watcher thread (`src/watcher.rs`) feeds an
   mpsc channel; `CHANNEL_POLL`=200ms drain + `TICK_RATE`=2s safety net. No tokio.
 - **Git light path** — `core/git.rs` (porcelain v2 parser). Fetched on a **background worker thread**
   (`App::GitStatusService`), **event-driven only** (first-seen / row-selection / push-pull / `r` /
   agent activity) — no periodic polling. `git_cache: HashMap<PathBuf, Option<GitStatus>>`.
 - **tmux orchestration** — `core/terminals/tmux.rs` + `terminals/mod.rs`. `launch` (split-window -P),
-  `stage_pane`/`unstage_pane` (join/break-pane), `resize_stage_top`, `send_input`, `approve_session`.
+  `stage_pane`/`unstage_pane` (join/break-pane), `resize_stage_top`, `send_input`, `approve_session`,
+  and (Phase 4c) `capture_pane` (read-only scrape of the permission dialog), `deny_session`/
+  `interrupt_session` (Escape), `tmux::send_key` (named keys vs literal text).
 
 ## Gotchas that have already burned a session
 

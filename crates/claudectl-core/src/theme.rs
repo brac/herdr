@@ -52,7 +52,9 @@ pub struct Theme {
 
     // Status colors
     pub status_needs_input: Color,
+    pub status_error: Color,
     pub status_processing: Color,
+    pub status_job_done: Color,
     pub status_waiting: Color,
     pub status_unknown: Color,
     pub status_idle: Color,
@@ -102,7 +104,9 @@ impl Theme {
         Self {
             mode: ThemeMode::Dark,
             status_needs_input: DRAC_PURPLE, // the "purple Need Input" notice
+            status_error: DRAC_RED,
             status_processing: DRAC_GREEN,
+            status_job_done: DRAC_CYAN, // task complete, awaiting you — distinct from Waiting
             status_waiting: DRAC_YELLOW,
             status_unknown: DRAC_COMMENT,
             status_idle: DRAC_COMMENT,
@@ -135,7 +139,9 @@ impl Theme {
         Self {
             mode: ThemeMode::Light,
             status_needs_input: Color::Magenta,
+            status_error: Color::Red,
             status_processing: Color::Blue,
+            status_job_done: Color::Cyan,
             status_waiting: Color::Rgb(180, 140, 0), // Dark yellow
             status_unknown: Color::Gray,
             status_idle: Color::Gray,
@@ -169,7 +175,9 @@ impl Theme {
         Self {
             mode: ThemeMode::None,
             status_needs_input: Color::Reset,
+            status_error: Color::Reset,
             status_processing: Color::Reset,
+            status_job_done: Color::Reset,
             status_waiting: Color::Reset,
             status_unknown: Color::Reset,
             status_idle: Color::Reset,
@@ -203,7 +211,9 @@ impl Theme {
         use crate::session::SessionStatus;
         match status {
             SessionStatus::NeedsInput => self.status_needs_input,
+            SessionStatus::Error => self.status_error,
             SessionStatus::Processing => self.status_processing,
+            SessionStatus::JobDone => self.status_job_done,
             SessionStatus::WaitingInput => self.status_waiting,
             SessionStatus::Unknown => self.status_unknown,
             SessionStatus::Idle => self.status_idle,

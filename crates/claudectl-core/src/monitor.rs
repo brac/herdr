@@ -32,6 +32,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
     let mut last_type = session.last_msg_type.clone();
     let mut last_stop_reason = session.last_stop_reason.clone();
     let mut is_waiting_for_task = session.is_waiting_for_task;
+    let mut last_was_api_error = session.last_was_api_error;
     let mut saw_non_empty_line = false;
     let mut recognized_events = 0usize;
     let mut saw_parent_usage = false;
@@ -48,6 +49,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                         &last_type,
                         &last_stop_reason,
                         is_waiting_for_task,
+                        last_was_api_error,
                         false,
                     );
                     return;
@@ -69,6 +71,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                     last_type.clear();
                     last_stop_reason.clear();
                     is_waiting_for_task = false;
+                    last_was_api_error = false;
                 }
 
                 if session.jsonl_offset < file_len {
@@ -80,6 +83,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                             &last_type,
                             &last_stop_reason,
                             is_waiting_for_task,
+                            last_was_api_error,
                             false,
                         );
                         return;
@@ -107,8 +111,16 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                             TranscriptEvent::WaitingForTask => {
                                 is_waiting_for_task = true;
                             }
+                            TranscriptEvent::ApiError { text } => {
+                                // Sticky until a newer message supersedes it.
+                                last_was_api_error = true;
+                                session.last_api_error_msg = text;
+                            }
                             TranscriptEvent::Message(message) => {
                                 is_waiting_for_task = false;
+                                // A real message after an error means it cleared
+                                // (retry succeeded or a new turn began).
+                                last_was_api_error = false;
                                 last_type = match message.role {
                                     TranscriptRole::Assistant => "assistant".to_string(),
                                     TranscriptRole::User => "user".to_string(),
@@ -279,6 +291,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
         &last_type,
         &last_stop_reason,
         is_waiting_for_task,
+        last_was_api_error,
         saw_parent_usage,
     );
 }
@@ -288,6 +301,7 @@ fn finalize_usage(
     last_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
+    last_was_api_error: bool,
     saw_parent_usage: bool,
 ) {
     let resolved_profile = models::resolve(&session.model);
@@ -329,8 +343,15 @@ fn finalize_usage(
     session.last_msg_type = last_type.to_string();
     session.last_stop_reason = last_stop_reason.to_string();
     session.is_waiting_for_task = is_waiting_for_task;
+    session.last_was_api_error = last_was_api_error;
 
-    infer_status(session, last_type, last_stop_reason, is_waiting_for_task);
+    infer_status(
+        session,
+        last_type,
+        last_stop_reason,
+        is_waiting_for_task,
+        last_was_api_error,
+    );
 
     // Status diagnostics (no-op unless HERDR_LOG is set; see logger::init). The
     // signals here are exactly what infer_status branched on, so a stuck status
@@ -369,11 +390,22 @@ pub fn infer_status(
     last_msg_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
+    last_was_api_error: bool,
 ) {
     // CPU is the strongest real-time signal — if the process is burning CPU,
-    // it's processing regardless of what the JSONL says (JSONL can lag).
+    // it's processing regardless of what the JSONL says (JSONL can lag). This
+    // also covers an automatic retry after an API error: while it's working,
+    // show Processing rather than a stale Error.
     if session.cpu_percent > 5.0 {
         session.status = SessionStatus::Processing;
+        return;
+    }
+
+    // The last transcript event was an API error and nothing newer has
+    // superseded it (and the process isn't actively retrying) → surface Error
+    // so it's visible in the roster (BACKLOG "Error Display").
+    if last_was_api_error {
+        session.status = SessionStatus::Error;
         return;
     }
 
@@ -389,8 +421,10 @@ pub fn infer_status(
     }
 
     if last_msg_type == "assistant" && last_stop_reason == "end_turn" {
-        // Claude finished its turn — waiting for user input
-        // But if it's been a long time (>10 min), mark as Idle
+        // Claude finished its turn — the task is done and it's waiting for the
+        // user's next instruction. That's distinct from "Waiting" (a request in
+        // flight to the API): here nothing is happening until the user acts, so
+        // report JobDone (BACKLOG "Split waiting states"). After a long gap, Idle.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -400,7 +434,7 @@ pub fn infer_status(
         if age_mins > IDLE_AFTER_MINS {
             session.status = SessionStatus::Idle;
         } else {
-            session.status = SessionStatus::WaitingInput;
+            session.status = SessionStatus::JobDone;
         }
         return;
     }
@@ -700,7 +734,7 @@ mod tests {
         let mut s = idle_session();
         s.cpu_percent = 0.0;
         s.last_message_ts = now_ms().saturating_sub(60_000); // 60s ago
-        infer_status(&mut s, "user", "", false);
+        infer_status(&mut s, "user", "", false, false);
         assert_eq!(s.status, SessionStatus::WaitingInput);
     }
 
@@ -711,7 +745,7 @@ mod tests {
         let mut s = idle_session();
         s.cpu_percent = 0.0;
         s.last_message_ts = now_ms(); // just now
-        infer_status(&mut s, "user", "", false);
+        infer_status(&mut s, "user", "", false, false);
         assert_eq!(s.status, SessionStatus::Processing);
     }
 
@@ -721,7 +755,7 @@ mod tests {
         let mut s = idle_session();
         s.cpu_percent = 12.0;
         s.last_message_ts = now_ms().saturating_sub(120_000);
-        infer_status(&mut s, "user", "", false);
+        infer_status(&mut s, "user", "", false, false);
         assert_eq!(s.status, SessionStatus::Processing);
     }
 
@@ -730,8 +764,37 @@ mod tests {
         let mut s = idle_session();
         s.cpu_percent = 0.0;
         s.last_message_ts = now_ms().saturating_sub(20 * 60_000); // 20 min ago
-        infer_status(&mut s, "user", "", false);
+        infer_status(&mut s, "user", "", false, false);
         assert_eq!(s.status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn assistant_end_turn_reads_as_job_done_not_waiting() {
+        // BACKLOG "Split waiting states": an assistant end_turn means the task is
+        // complete and it's the user's move → JobDone, distinct from API-wait.
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.last_message_ts = now_ms(); // just finished
+        infer_status(&mut s, "assistant", "end_turn", false, false);
+        assert_eq!(s.status, SessionStatus::JobDone);
+    }
+
+    #[test]
+    fn api_error_flag_reads_as_error_when_idle() {
+        // BACKLOG "Error Display": a sticky API error with low CPU surfaces Error.
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        infer_status(&mut s, "assistant", "end_turn", false, true);
+        assert_eq!(s.status, SessionStatus::Error);
+    }
+
+    #[test]
+    fn active_retry_after_error_reads_as_processing() {
+        // If CPU is high (auto-retry in flight), prefer Processing over a stale Error.
+        let mut s = idle_session();
+        s.cpu_percent = 40.0;
+        infer_status(&mut s, "assistant", "end_turn", false, true);
+        assert_eq!(s.status, SessionStatus::Processing);
     }
 
     #[test]

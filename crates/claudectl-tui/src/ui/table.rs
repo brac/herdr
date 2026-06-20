@@ -221,6 +221,26 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 // ahead/behind) inline in the header. Colors come from the theme,
                 // so NO_COLOR (ThemeMode::None → Color::Reset) is respected (§6).
                 let mut header_spans = vec![Span::styled(header_text, header_style)];
+                // Persistent at-a-glance approval cue (BACKLOG): if any agent in
+                // this project is blocked on a permission prompt, flag the header
+                // so it's obvious while scanning, even before reading the rows.
+                let needs_count = group
+                    .pids
+                    .iter()
+                    .filter(|pid| {
+                        app.sessions
+                            .iter()
+                            .any(|s| s.pid == **pid && s.status == SessionStatus::NeedsInput)
+                    })
+                    .count();
+                if needs_count > 0 {
+                    header_spans.push(Span::styled(
+                        format!("  \u{26a0}{needs_count}"),
+                        Style::default()
+                            .fg(t.status_needs_input)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if let Some(git) = &group.git {
                     header_spans.push(Span::styled(
                         format!("  {}", git.branch),
@@ -285,7 +305,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let widths = [
         Constraint::Length(7),  // PID
         Constraint::Min(10),    // Project (flex)
-        Constraint::Length(14), // Status (wider for * indicator)
+        Constraint::Length(17), // Status (fits "⚠ Needs Input (2m)")
         Constraint::Length(13), // Context bar
         Constraint::Length(8),  // Cost
         Constraint::Length(9),  // $/hr
@@ -553,9 +573,10 @@ fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
     } else if s.status == SessionStatus::Unknown {
         s.telemetry_status.short_label().to_string()
     } else if s.status == SessionStatus::NeedsInput {
+        // Leading ⚠ so an approval need reads at a glance even in NO_COLOR.
         match app.format_wait_time(s.pid) {
-            Some(wait) => format!("{} ({})", s.status, wait),
-            None => s.status.to_string(),
+            Some(wait) => format!("\u{26a0} {} ({})", s.status, wait),
+            None => format!("\u{26a0} {}", s.status),
         }
     } else {
         s.status.to_string()

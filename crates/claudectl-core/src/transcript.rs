@@ -33,6 +33,10 @@ pub struct TranscriptMessage {
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
     WaitingForTask,
+    /// An API-level error (rate limit, overloaded, etc.). Claude Code writes these
+    /// as a `<synthetic>` assistant message flagged `isApiErrorMessage: true` with
+    /// an "API Error: …" text block — distinct from a tool `is_error` result.
+    ApiError { text: String },
     Message(TranscriptMessage),
 }
 
@@ -41,6 +45,15 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
 
     if is_waiting_for_task(&entry) {
         return Some(TranscriptEvent::WaitingForTask);
+    }
+
+    if entry.get("isApiErrorMessage").and_then(|v| v.as_bool()) == Some(true) {
+        let text = entry
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(extract_text_content)
+            .unwrap_or_else(|| "API error".to_string());
+        return Some(TranscriptEvent::ApiError { text });
     }
 
     let msg = entry.get("message")?;

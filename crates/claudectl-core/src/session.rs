@@ -5,11 +5,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+// Declaration order == urgency order, so the derived `Ord` matches `sort_key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionStatus {
     NeedsInput,   // Blocked — waiting for user to approve/confirm (permission prompt)
+    Error,        // Last turn hit an API error (rate limit, overloaded, etc.)
     Processing,   // Actively generating or executing tools
-    WaitingInput, // Done responding, waiting for user's next prompt
+    JobDone,      // Turn complete — waiting for the user's next task
+    WaitingInput, // Waiting on the API to respond (request in flight)
     Unknown,      // Process is alive, but transcript telemetry is unavailable
     Idle,         // No recent activity, stale session
     Finished,     // Process exited
@@ -19,7 +22,9 @@ impl fmt::Display for SessionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NeedsInput => write!(f, "Needs Input"),
+            Self::Error => write!(f, "Error"),
             Self::Processing => write!(f, "Processing"),
+            Self::JobDone => write!(f, "Job Done"),
             Self::WaitingInput => write!(f, "Waiting"),
             Self::Unknown => write!(f, "Unknown"),
             Self::Idle => write!(f, "Idle"),
@@ -32,11 +37,13 @@ impl SessionStatus {
     pub fn sort_key(&self) -> u8 {
         match self {
             Self::NeedsInput => 0,
-            Self::Processing => 1,
-            Self::WaitingInput => 2,
-            Self::Unknown => 3,
-            Self::Idle => 4,
-            Self::Finished => 5,
+            Self::Error => 1,
+            Self::Processing => 2,
+            Self::JobDone => 3,
+            Self::WaitingInput => 4,
+            Self::Unknown => 5,
+            Self::Idle => 6,
+            Self::Finished => 7,
         }
     }
 }
@@ -153,6 +160,11 @@ pub struct ClaudeSession {
     pub last_msg_type: String,
     pub last_stop_reason: String,
     pub is_waiting_for_task: bool,
+    /// True when the most recent transcript event was an API error (`<synthetic>`
+    /// `isApiErrorMessage`), persisted across ticks until a newer message arrives.
+    pub last_was_api_error: bool,
+    /// The text of that API error ("API Error: 529 Overloaded…"), for display.
+    pub last_api_error_msg: String,
     /// Pending tool call details for rule-based auto-actions.
     pub pending_tool_name: Option<String>,
     pub pending_tool_input: Option<String>, // Extracted command string (for Bash)
@@ -390,6 +402,8 @@ impl ClaudeSession {
             last_msg_type: String::new(),
             last_stop_reason: String::new(),
             is_waiting_for_task: false,
+            last_was_api_error: false,
+            last_api_error_msg: String::new(),
             pending_tool_name: None,
             pending_tool_input: None,
             pending_file_path: None,
@@ -417,7 +431,9 @@ impl ClaudeSession {
     pub fn record_activity(&mut self) {
         let level = match self.status {
             SessionStatus::Processing => 7,
+            SessionStatus::Error => 5,
             SessionStatus::NeedsInput => 4,
+            SessionStatus::JobDone => 3,
             SessionStatus::WaitingInput => 2,
             SessionStatus::Unknown => 2,
             SessionStatus::Idle => 1,
@@ -499,7 +515,9 @@ impl ClaudeSession {
             .unwrap_or("Unknown");
         let status = match status_str {
             "Needs Input" => SessionStatus::NeedsInput,
+            "Error" => SessionStatus::Error,
             "Processing" => SessionStatus::Processing,
+            "Job Done" => SessionStatus::JobDone,
             "Waiting" => SessionStatus::WaitingInput,
             "Idle" => SessionStatus::Idle,
             "Finished" => SessionStatus::Finished,

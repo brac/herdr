@@ -18,13 +18,15 @@ under the project.
 > roster reads project → agent → sub-agent. Indent is suppressed in flat view (no header to nest under).
 > `ui/table.rs` (`session_row`/`subagent_row`).
 
-## Bug: Status and Context is sometimes incorrect - PARTIAL
+## Bug: Status and Context is sometimes incorrect - DONE
 I select a row in herdr, I press n to start an agent, it sarts and in herdr is report 15% context used up and processing already?
 I haven't even asked a question yet
 > "Processing already" half resolved: instantaneous CPU now seeds idle on a fresh agent's first sample
-> instead of inheriting `ps %cpu`'s lifetime average (`fix:` 1e54cd7). The "15% context before any
-> prompt" half is **not** verified — needs a fresh repro; likely the first API call's system-prompt
-> tokens. See the `herdr-status` skill.
+> instead of inheriting `ps %cpu`'s lifetime average (`fix:` 1e54cd7). The "15% context" half is
+> **not a bug**: that's real consumed context — the first API call already includes the system prompt,
+> tool definitions, CLAUDE.md, and env, which on a 200k model lands ~15% before you type anything
+> (`monitor.rs:146` tracks the last call's input+cache tokens). Left as-is rather than hiding accurate
+> data. See the `herdr-status` skill.
 
 ## Feature: Better colors - DONE
 The hightlight row color is too bright and hard to read. The colors are overall could use some work. 
@@ -100,8 +102,9 @@ when waiting for an approavl to run a tool, there is no indicator in herdr roste
 purple Need Input notice, but then it kept going. maybe becaues I was on auto mode?
 > Partial: Phase 4c added the **approval inspector** (`A`) — `tmux capture-pane` shows the real permission
 > dialog (invisible in JSONL) with approve/deny/interrupt from the roster (`feat:` 581c86d). NeedsInput
-> detection also tightened via the status work. Still open: a persistent at-a-glance roster indicator,
-> and the auto-mode "kept going" interaction the note describes.
+> detection also tightened via the status work. **Persistent indicator now added** (`ui/table.rs`): a
+> bold `⚠N` badge on any project header hosting N agents awaiting approval, plus a leading `⚠` on the
+> agent's Status cell (visible in NO_COLOR too). Still open: the auto-mode "kept going" interaction.
 
 ## Bug: $/h is wild - DONE
 The nuimber is up and down and all over the palce. I feel like it should be the average of an hour? or er min?
@@ -124,8 +127,21 @@ Launhcing an agent in the roster view with n. The repo will sort to the top with
 ## Bug: Reoster bar is too small with only one or two active agents
 The roster bar should be a minimum for 12 rows when there are a small number of active agents. Ruight now there is one active agent and an open chat window and I see 7 rows. Header, Columns names, 2 repos, session overview and fleet bar.
 
-## Feature: Split waiting states
+## Feature: Split waiting states - DONE
 If the agent is waiting for a repsonse from the API, the roster displays Waiting. The a task is complete the roster also dispalys Waiting. When a task is complete and the agent is waiting for the next task from the usr, then I want that task to be Job Done. So we can tell when we are waiting on the API and when we are waiting ont he user
+> Resolved: new `SessionStatus::JobDone` ("Job Done", cyan). `infer_status` now splits the two:
+> assistant `end_turn` (turn complete, your move) → **Job Done**; a `user`/tool_result line where Claude
+> still owes output (request in flight) → **Waiting**. (`monitor.rs`; tests
+> `assistant_end_turn_reads_as_job_done_not_waiting` + the existing user-branch tests.)
 
-## Feature: Error Display 
+## Feature: Error Display - DONE
 Somtimes we hit an API error. The Roster should display Error in the stats when this is encounted
+> Resolved: new `SessionStatus::Error` (red, sorts just below Needs Input). Claude Code writes API
+> errors as a `<synthetic>` `isApiErrorMessage` line ("API Error: 529 Overloaded…"); `transcript.rs`
+> emits a `TranscriptEvent::ApiError`, `monitor.rs` keeps it sticky (`last_was_api_error`) until a
+> newer message supersedes it, and `infer_status` reports Error when CPU is low (an active retry stays
+> Processing). Tests `api_error_flag_reads_as_error_when_idle`, `active_retry_after_error_reads_as_processing`.
+
+## Bug: Sparklines
+The per agent sparklin looks like it only has two states, on and off
+The fleet sparkline has all sorts of varitaion. Make the roster sparkline more granula like the fleet sparkline

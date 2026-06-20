@@ -3330,9 +3330,11 @@ impl App {
             c.total += 1;
             c.burn_per_hr += s.burn_rate_per_hr;
             match s.status {
-                SessionStatus::NeedsInput => c.needs_input += 1,
+                // Both want the user: an approval prompt or an API error to recover from.
+                SessionStatus::NeedsInput | SessionStatus::Error => c.needs_input += 1,
                 SessionStatus::Processing => c.processing += 1,
-                SessionStatus::WaitingInput => c.waiting += 1,
+                // Waiting on the API, or job done awaiting the next task — not engaged-busy.
+                SessionStatus::WaitingInput | SessionStatus::JobDone => c.waiting += 1,
                 // Idle/Unknown/Finished all read as "not currently engaged".
                 _ => c.idle += 1,
             }
@@ -3665,7 +3667,7 @@ impl App {
                 return;
             }
             match session.status {
-                SessionStatus::WaitingInput | SessionStatus::Idle => {
+                SessionStatus::WaitingInput | SessionStatus::JobDone | SessionStatus::Idle => {
                     match self
                         .runtime
                         .actions
@@ -3692,6 +3694,9 @@ impl App {
                 }
                 SessionStatus::Finished => {
                     self.status_msg = "Cannot compact — session has finished".into();
+                }
+                SessionStatus::Error => {
+                    self.status_msg = "Cannot compact — session hit an API error".into();
                 }
             }
         }
@@ -3877,11 +3882,13 @@ fn merge_discovered_session(prev: ClaudeSession, new: ClaudeSession) -> ClaudeSe
 fn status_urgency(status: SessionStatus) -> u8 {
     match status {
         SessionStatus::NeedsInput => 0,
-        SessionStatus::Processing => 1,
-        SessionStatus::WaitingInput => 2,
-        SessionStatus::Idle => 3,
-        SessionStatus::Unknown => 4,
-        SessionStatus::Finished => 5,
+        SessionStatus::Error => 1,
+        SessionStatus::Processing => 2,
+        SessionStatus::JobDone => 3,
+        SessionStatus::WaitingInput => 4,
+        SessionStatus::Idle => 5,
+        SessionStatus::Unknown => 6,
+        SessionStatus::Finished => 7,
     }
 }
 

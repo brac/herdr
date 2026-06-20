@@ -994,15 +994,51 @@ pub fn stage_pane(target: &str, previous: Option<&str>) -> Result<(), String> {
     tmux::join_into_herdr(target)
 }
 
-/// Resize herdr's own pane to `rows` tall (the stage split sizes the agent to
-/// fill the rest). No-op outside tmux. Errors are non-fatal — tmux clamps.
+/// Best-effort target for the staged agent pane below herdr: when the window has
+/// the room, herdr is capped so the agent gets at least this many rows. It's a
+/// *target*, not a hard floor — in a window too small to fit both this and the
+/// roster, herdr's own content wins (see [`MIN_STAGE_TOP_ROWS`]) and the agent
+/// takes whatever's left (BACKLOG: auto-height). Because `stage_top_rows` is
+/// content-sized, a lone agent already leaves the agent most of the screen; this
+/// mainly bounds the agent when the roster is tall (many active agents).
+pub const MIN_STAGE_BOTTOM_ROWS: u16 = 20;
+/// Floor on herdr's own pane: never shrink it below the rows its roster needs
+/// (header + an agent + chrome) just to hand the staged agent its target. Keeps
+/// the roster readable when the window can't satisfy both.
+const MIN_STAGE_TOP_ROWS: u16 = 6;
+/// Rows tmux spends on the divider between herdr and the staged agent.
+const STAGE_DIVIDER_ROWS: u16 = 1;
+
+/// Pick herdr's pane height: show its roster (`desired`) but cap it so the staged
+/// agent gets [`MIN_STAGE_BOTTOM_ROWS`] when the window allows — never starving
+/// herdr below its content ([`MIN_STAGE_TOP_ROWS`]) to do so. `window_height` is
+/// the whole window (both panes + divider). Pure, so the math is testable without
+/// tmux.
+fn cap_stage_top_rows(desired: u16, window_height: u16) -> u16 {
+    // Cap herdr so the agent below keeps its target; floor it so a tight window
+    // shrinks the agent, not herdr's roster. The floor never exceeds what herdr
+    // actually wants (`desired`).
+    let herdr_floor = desired.min(MIN_STAGE_TOP_ROWS);
+    let herdr_cap = window_height.saturating_sub(MIN_STAGE_BOTTOM_ROWS + STAGE_DIVIDER_ROWS);
+    desired.min(herdr_cap).max(herdr_floor).max(1)
+}
+
+/// Resize herdr's own pane to show its roster (`rows`) while leaving the staged
+/// agent below a usable height — see [`cap_stage_top_rows`]. No-op outside tmux.
+/// Errors are non-fatal — tmux clamps.
 pub fn resize_stage_top(rows: u16) -> Result<(), String> {
     if !matches!(detect_terminal(), Terminal::Tmux) {
         return Ok(());
     }
     let herdr = std::env::var("TMUX_PANE").map_err(|_| "herdr is not inside tmux".to_string())?;
+    // Keep a usable bottom pane: cap against the live window height when tmux
+    // reports it; otherwise fall back to the raw request and let tmux clamp.
+    let target = match tmux::window_height() {
+        Some(h) => cap_stage_top_rows(rows, h),
+        None => rows,
+    };
     let output = std::process::Command::new("tmux")
-        .args(["resize-pane", "-t", &herdr, "-y", &rows.to_string()])
+        .args(["resize-pane", "-t", &herdr, "-y", &target.to_string()])
         .output()
         .map_err(|e| format!("tmux resize-pane failed: {e}"))?;
     if output.status.success() {
@@ -1174,6 +1210,48 @@ pub fn run_osascript(script: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_stage_top_leaves_room_for_the_bottom_pane() {
+        // Roomy window: herdr keeps its full request, bottom gets the surplus.
+        assert_eq!(cap_stage_top_rows(20, 80), 20);
+        let bottom = 80 - cap_stage_top_rows(20, 80) - STAGE_DIVIDER_ROWS;
+        assert!(bottom >= MIN_STAGE_BOTTOM_ROWS);
+    }
+
+    #[test]
+    fn cap_stage_top_shrinks_herdr_to_protect_the_bottom() {
+        // A tall roster (many active agents) that would otherwise eat the window
+        // is capped so the staged agent keeps MIN_STAGE_BOTTOM_ROWS + the divider.
+        let h = 30;
+        let capped = cap_stage_top_rows(40, h);
+        assert_eq!(capped, h - MIN_STAGE_BOTTOM_ROWS - STAGE_DIVIDER_ROWS);
+        let bottom = h - capped - STAGE_DIVIDER_ROWS;
+        assert_eq!(bottom, MIN_STAGE_BOTTOM_ROWS);
+    }
+
+    #[test]
+    fn cap_stage_top_never_starves_the_roster_for_the_bottom_target() {
+        // Regression: a small/medium window must NOT squeeze herdr below its own
+        // content just to hand the agent MIN_STAGE_BOTTOM_ROWS. With one agent
+        // (desired == MIN_STAGE_TOP_ROWS) in a window only slightly taller than
+        // the bottom target, herdr keeps its roster height and the agent yields.
+        let desired = MIN_STAGE_TOP_ROWS;
+        let window = MIN_STAGE_BOTTOM_ROWS + 5; // too small for desired + target + divider
+        assert_eq!(cap_stage_top_rows(desired, window), MIN_STAGE_TOP_ROWS);
+        // Roster floor is honored across a sweep of tight windows.
+        for window in 10..=(MIN_STAGE_BOTTOM_ROWS + MIN_STAGE_TOP_ROWS) {
+            assert!(cap_stage_top_rows(desired, window) >= MIN_STAGE_TOP_ROWS);
+        }
+    }
+
+    #[test]
+    fn cap_stage_top_handles_tiny_windows_without_zeroing() {
+        // Degenerate windows never collapse herdr to 0; it keeps its content floor
+        // (tmux clamps the over-tall request against the real window).
+        assert!(cap_stage_top_rows(40, 1) >= 1);
+        assert!(cap_stage_top_rows(40, 0) >= 1);
+    }
 
     #[test]
     fn help_summary_lists_kitty_actions() {

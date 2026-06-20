@@ -3762,16 +3762,24 @@ impl App {
         self.roster_layout().1.len()
     }
 
-    /// Rows herdr's pane needs to show the roster without scrolling: one per
-    /// roster row (agents add their subagent rows) plus chrome (table header,
-    /// footer, status, borders). Clamped so it never eats the whole window. Used
-    /// to auto-size herdr's pane when an agent is staged below it.
+    /// Rows herdr's pane needs to show the *agent-bearing* roster without
+    /// scrolling: one per header of a project that actually hosts agents, one per
+    /// agent (plus its subagent rows), plus chrome (table header, footer, status,
+    /// borders). Idle, zero-agent project headers are deliberately excluded — they
+    /// sink to the bottom of the roster, so reserving height for them would push
+    /// herdr's pane tall and crowd out the staged window when many repos are
+    /// present (BACKLOG: auto-height). Clamped so it never eats the whole window.
+    /// Used to auto-size herdr's pane when an agent is staged below it.
     fn stage_top_rows(&self) -> u16 {
-        let (_, rows) = self.roster_layout();
+        let (groups, rows) = self.roster_layout();
         let visual: usize = rows
             .iter()
             .map(|row| match row {
-                RosterRow::Header(_) => 1,
+                // Only count a header when its project hosts at least one agent;
+                // idle repos add no height.
+                RosterRow::Header(gi) => {
+                    usize::from(groups.get(*gi).is_some_and(|g| !g.pids.is_empty()))
+                }
                 RosterRow::Agent(si) => {
                     1 + self
                         .sessions
@@ -4080,6 +4088,32 @@ mod tests {
         assert_eq!(groups[0].session_count, 1);
         assert_eq!(groups[1].name, "idle");
         assert_eq!(groups[1].session_count, 0);
+    }
+
+    #[test]
+    fn stage_top_rows_ignores_idle_zero_agent_projects() {
+        // BACKLOG auto-height: an idle, agent-less project header must NOT reserve
+        // pane height. make_grouped_app has one active project ("alpha", agent 11)
+        // and one idle project ("idle"). Only alpha's header + its one agent count:
+        // 1 header + 1 agent + 4 chrome = 6 (which is also the floor).
+        let app = make_grouped_app();
+        assert_eq!(app.stage_top_rows(), 6);
+
+        // Adding more idle projects must not grow the pane — only agent-bearing
+        // projects do. Height stays at the same 6 rows.
+        let mut padded = app;
+        for i in 0..20 {
+            padded.projects.push(Project {
+                path: PathBuf::from(format!("/tmp/idle-{i}")),
+                name: format!("idle-{i}"),
+                has_git: true,
+            });
+        }
+        assert_eq!(
+            padded.stage_top_rows(),
+            6,
+            "idle repos must not inflate herdr's staged pane height"
+        );
     }
 
     #[test]

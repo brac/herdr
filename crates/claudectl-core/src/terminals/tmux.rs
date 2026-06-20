@@ -61,6 +61,22 @@ pub fn pane_for_tty(tty: &str) -> Option<String> {
     None
 }
 
+/// Total rows of herdr's tmux window (both split panes plus the divider). Used
+/// to cap herdr's pane height so the staged agent below keeps a usable minimum.
+/// `None` if not in tmux or the value can't be parsed. (Composing tmux — asking
+/// for N rows — not tracking geometry ourselves; CLAUDE.md §8.)
+pub fn window_height() -> Option<u16> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", &pane, "#{window_height}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 /// Move `pane` into herdr's window as the bottom split (the single agent
 /// "stage"), keeping focus on herdr. Targets herdr's own pane via `$TMUX_PANE`.
 pub fn join_into_herdr(pane: &str) -> Result<(), String> {

@@ -157,7 +157,14 @@ pub struct ClaudeSession {
     pub burn_rate_per_hr: f64,
     pub subagent_count: usize,
     pub active_subagent_count: usize,
+    /// Subagents whose transcript was modified recently (within
+    /// `discovery::SUBAGENT_ACTIVE_SECS`) — the live ones, shown as individual
+    /// rows; a subset of `subagent_jsonl_paths`.
     pub active_subagent_jsonl_paths: Vec<PathBuf>,
+    /// *Every* subagent transcript discovered for this session (active +
+    /// completed). Drives token rollup so a subagent that started and finished
+    /// is still attributed; `active_subagent_jsonl_paths` is the fresh subset.
+    pub subagent_jsonl_paths: Vec<PathBuf>,
     pub subagent_rollups: HashMap<PathBuf, SubagentRollup>,
     pub activity_history: Vec<f32>, // Ring buffer of CPU% per tick for the activity sparkline
     pub files_modified: HashMap<String, u32>, // file path -> edit count
@@ -275,6 +282,10 @@ pub struct SubagentRollup {
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
     pub model: String,
+    /// Human label resolved once from the `agent-*.meta.json` sidecar
+    /// (`agentType` + `description`, e.g. "Explore · Map launch→discovery"),
+    /// falling back to the transcript's `attributionAgent` or the file stem.
+    pub label: String,
     pub cost_estimate_unverified: bool,
     pub usage_metrics_available: bool,
     /// Dedup state for this subagent transcript (keyed `message.id:requestId`).
@@ -418,6 +429,7 @@ impl ClaudeSession {
             subagent_count: 0,
             active_subagent_count: 0,
             active_subagent_jsonl_paths: Vec::new(),
+            subagent_jsonl_paths: Vec::new(),
             subagent_rollups: HashMap::new(),
             activity_history: Vec::new(),
             files_modified: HashMap::new(),
@@ -627,7 +639,11 @@ impl ClaudeSession {
 
         for (path, rollup) in &self.subagent_rollups {
             let row = SubagentBreakdown {
-                label: subagent_label(path),
+                label: if rollup.label.is_empty() {
+                    subagent_label(path)
+                } else {
+                    rollup.label.clone()
+                },
                 state: if active_paths.contains(path) {
                     SubagentState::Active
                 } else {

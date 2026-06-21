@@ -176,40 +176,91 @@ fn extract_resume_uuid(command_args: &str) -> Option<String> {
     Some(token.to_string())
 }
 
-/// Feature #29: Scan for subagent task .jsonl files.
-/// Claude Code spawns sub-agents whose files live in:
-///   /tmp/claude-{uid}/{project_slug}/{sessionId}/tasks/
-pub fn scan_subagents(sessions: &mut [ClaudeSession]) {
-    let uid = unsafe { libc::getuid() };
-    let tmp_base = PathBuf::from(format!("/tmp/claude-{uid}"));
+/// A subagent transcript is "active" if its JSONL was written within this many
+/// seconds — fresh writes mean the sub-agent is still streaming. Older ones have
+/// finished but their files (and token spend) persist on disk, so they still roll
+/// up into the parent; they just collapse into the "completed (N)" row.
+pub const SUBAGENT_ACTIVE_SECS: u64 = 25;
 
-    if !tmp_base.exists() {
-        for session in sessions.iter_mut() {
-            session.active_subagent_count = 0;
-            session.active_subagent_jsonl_paths.clear();
-        }
-        return;
-    }
+/// Scan for a session's sub-agent transcripts (Task tool / workflow agents).
+///
+/// Claude Code (≥ v2.1.x) writes each sub-agent to its own file under the parent
+/// session's transcript dir:
+///   `~/.claude/projects/{slug}/{sessionId}/subagents/agent-*.jsonl`
+///   `~/.claude/projects/{slug}/{sessionId}/subagents/workflows/wf_*/agent-*.jsonl`
+/// (the old `/tmp/claude-{uid}/{slug}/{sessionId}/tasks/` path holds only `.output`
+/// scratch files — never the `.jsonl` we need, which is why sub-agents used to be
+/// invisible). We derive the dir from `jsonl_path` so resumed/relocated sessions
+/// resolve correctly, then split discovered files into *all* (rollup) and the
+/// recently-written *active* subset (live rows).
+pub fn scan_subagents(sessions: &mut [ClaudeSession]) {
+    let now = std::time::SystemTime::now();
 
     for session in sessions.iter_mut() {
-        let slug = cwd_to_slug(&session.cwd);
-        let tasks_dir = tmp_base.join(&slug).join(&session.session_id).join("tasks");
-
-        if !tasks_dir.exists() {
+        let Some(subagents_dir) = subagents_dir_for(session) else {
             session.active_subagent_count = 0;
             session.active_subagent_jsonl_paths.clear();
+            session.subagent_jsonl_paths.clear();
+            continue;
+        };
+
+        if !subagents_dir.exists() {
+            session.active_subagent_count = 0;
+            session.active_subagent_jsonl_paths.clear();
+            session.subagent_jsonl_paths.clear();
             continue;
         }
 
         let mut jsonls = Vec::new();
-        collect_subagent_jsonls(&tasks_dir, &mut jsonls);
+        collect_subagent_jsonls(&subagents_dir, &mut jsonls);
         jsonls.sort();
-        session.active_subagent_count = jsonls.len();
-        session.active_subagent_jsonl_paths = jsonls;
+
+        let active: Vec<PathBuf> = jsonls
+            .iter()
+            .filter(|p| is_recently_modified(p, now, SUBAGENT_ACTIVE_SECS))
+            .cloned()
+            .collect();
+
+        session.active_subagent_count = active.len();
+        session.active_subagent_jsonl_paths = active;
+        session.subagent_jsonl_paths = jsonls;
     }
 }
 
-fn collect_subagent_jsonls(dir: &PathBuf, jsonls: &mut Vec<PathBuf>) {
+/// The `subagents/` directory for a session, derived from its resolved transcript
+/// path (`{sessionId}.jsonl` → `{sessionId}/subagents`). Falls back to the
+/// slug+id path under `projects/` when the transcript hasn't resolved yet.
+fn subagents_dir_for(session: &ClaudeSession) -> Option<PathBuf> {
+    if let Some(jsonl) = &session.jsonl_path {
+        let session_dir = jsonl.with_extension("");
+        return Some(session_dir.join("subagents"));
+    }
+    if session.session_id.is_empty() {
+        return None;
+    }
+    let slug = cwd_to_slug(&session.cwd);
+    Some(
+        projects_dir()
+            .join(slug)
+            .join(&session.session_id)
+            .join("subagents"),
+    )
+}
+
+/// True when `path`'s mtime is within `window_secs` of `now`.
+fn is_recently_modified(path: &Path, now: std::time::SystemTime, window_secs: u64) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    now.duration_since(modified)
+        .map(|age| age.as_secs() <= window_secs)
+        .unwrap_or(true) // mtime in the future (clock skew) → treat as fresh
+}
+
+fn collect_subagent_jsonls(dir: &Path, jsonls: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -220,7 +271,13 @@ fn collect_subagent_jsonls(dir: &PathBuf, jsonls: &mut Vec<PathBuf>) {
             collect_subagent_jsonls(&path, jsonls);
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+        // `agent-*.jsonl` only — skip the `agent-*.meta.json` sidecars.
+        let is_agent_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("agent-"));
+        if is_agent_jsonl {
             jsonls.push(path);
         }
     }
@@ -396,6 +453,93 @@ mod tests {
             s.jsonl_path.is_none(),
             "a fresh agent must not inherit another session's transcript"
         );
+    }
+
+    #[test]
+    fn subagents_dir_derives_from_resolved_transcript_path() {
+        // `{sessionId}.jsonl` → `{sessionId}/subagents` next to the transcript.
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "abc".into(),
+            cwd: "/home/u/proj".into(),
+            started_at: 0,
+        });
+        s.jsonl_path = Some(PathBuf::from("/x/-home-u-proj/abc.jsonl"));
+        assert_eq!(
+            subagents_dir_for(&s),
+            Some(PathBuf::from("/x/-home-u-proj/abc/subagents"))
+        );
+    }
+
+    #[test]
+    fn scan_subagents_finds_agent_jsonls_and_splits_active_by_mtime() {
+        // Lay out a real `…/{sessionId}/subagents/` dir with two agent transcripts
+        // (one fresh, one stale) plus a `.meta.json` sidecar that must be ignored.
+        let base = tempfile::tempdir().unwrap();
+        let cwd = "/home/u/proj";
+        let slug_dir = base.path().join(cwd_to_slug(cwd));
+        let id = "33333333-3333-3333-3333-333333333333";
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = touch_jsonl(&slug_dir, id);
+
+        let subagents = slug_dir.join(id).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let fresh = touch_jsonl(&subagents, "agent-fresh");
+        let stale = touch_jsonl(&subagents, "agent-stale");
+        // A sidecar + a non-agent file that must NOT be collected.
+        std::fs::File::create(subagents.join("agent-fresh.meta.json")).unwrap();
+        std::fs::File::create(subagents.join("notes.jsonl")).unwrap();
+
+        // Age the stale one well past the active window.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(SUBAGENT_ACTIVE_SECS + 600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            started_at: 0,
+        });
+        s.jsonl_path = Some(transcript);
+
+        scan_subagents(std::slice::from_mut(&mut s));
+
+        // All agent-*.jsonl discovered (sidecar + notes.jsonl excluded), fresh one active.
+        assert_eq!(s.subagent_jsonl_paths.len(), 2, "both agent transcripts discovered");
+        assert!(s.subagent_jsonl_paths.contains(&fresh));
+        assert!(s.subagent_jsonl_paths.contains(&stale));
+        assert_eq!(s.active_subagent_jsonl_paths, vec![fresh], "only the fresh one is active");
+        assert_eq!(s.active_subagent_count, 1);
+    }
+
+    #[test]
+    fn scan_subagents_clears_when_no_subagents_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let slug_dir = base.path().join(cwd_to_slug("/home/u/proj"));
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = touch_jsonl(&slug_dir, "nosub");
+
+        let mut s = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "nosub".into(),
+            cwd: "/home/u/proj".into(),
+            started_at: 0,
+        });
+        s.jsonl_path = Some(transcript);
+        // Pre-seed stale state to prove it gets cleared.
+        s.subagent_jsonl_paths = vec![PathBuf::from("/old")];
+        s.active_subagent_jsonl_paths = vec![PathBuf::from("/old")];
+        s.active_subagent_count = 1;
+
+        scan_subagents(std::slice::from_mut(&mut s));
+        assert!(s.subagent_jsonl_paths.is_empty());
+        assert!(s.active_subagent_jsonl_paths.is_empty());
+        assert_eq!(s.active_subagent_count, 0);
     }
 
     #[test]

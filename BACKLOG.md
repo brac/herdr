@@ -295,8 +295,44 @@ COMPARABLES §7 tail.
 ## Bug: If an anget process Job Done then the fleet count should be idle +1
 what is the difference between idle and waitign anyway? And jobs done? I feel like I am conflating terms
 
-## Feature: README.md
-Please write one for this repo. 
+## Bug: Approve / Deny not visible on roster view
+I think we have the functionlailty but I don't see any notification that an agent is asking for approve deny or some other reponse from the user before proceeding. If its just approve deny then I would like to be able to anserw that from the roster view. Other questions the user needs to go to the claude window for more details
 
-## Bug: Roster Height
-When I am using herdr in a vertical moniter the first thing I want to do after started a new agent is increase the height of the roster bar. It is too small and I want it bigger. Then I notice that I can only get it to a max height, and even if I go to the agent window and try to bring that down with ctrl + b + down arrow it snaps back to this roster max height. Why? I don't want a max height I want a min height for the roster view
+## Feature: Color the agents in roster
+The agent names, which seem to be just the same as the project that they were stated on are just regualr gray. Can we use a more poppy dracula themeed color? I want those to stand out more
+
+## Bug: Is that hooks thing installed?
+I thgouth that we had a hook to tell when an agent does stuff so we could more relaiably determine when an agent needs direction or is done with the job etc. How do we install that? target/release/herd install ?
+
+## Bug: Sub-agents never appeared in the roster + their tokens vanished - DONE
+When an agent spawns sub-agents (e.g. Explore agents in a code review), I want them tabbed under the
+orchestrating agent with their own cost/context, their token spend rolled into the parent's counters
+(kept even after they finish and disappear), and reflected in the today/wk/all fleet counters — which
+were also constantly 0.
+> Root cause: the sub-agent structs (`SubagentRollup`/`subagent_breakdown`/`subagent_row`) were all
+> built and correct, but fed by a **dead discovery path**. `discovery::scan_subagents` scanned
+> `/tmp/claude-{uid}/{slug}/{sessionId}/tasks/*.jsonl` ("Feature #29", inherited from claudectl) — but
+> Claude Code v2.1.x stores only `.output` scratch there. Real sub-agent transcripts live at
+> `~/.claude/projects/{slug}/{sessionId}/subagents/**/agent-*.jsonl` (+ `agent-*.meta.json`). So
+> `active_subagent_count` was always 0; no rows, no token attribution. Measured on live data: **409M
+> tokens across 491 sub-agent transcripts** (2.45M of it *output*) were being silently dropped.
+> Fixes:
+> - `scan_subagents` now derives the dir from `jsonl_path` (resume-safe) and recursively collects
+>   `agent-*.jsonl` (skips `.meta.json`), splitting **all-discovered** (`subagent_jsonl_paths`, drives
+>   rollup so a sub-agent that came and went is still counted) from the **fresh-by-mtime active subset**
+>   (`active_subagent_jsonl_paths`, < `SUBAGENT_ACTIVE_SECS`=25s → individual live rows; older collapse
+>   to "completed (N)"). `discovery.rs`.
+> - `monitor::refresh_subagent_rollups` iterates the full set; `update_subagent_rollup` resolves a
+>   human label once from the `agent-*.meta.json` sidecar (`agentType · description`, e.g.
+>   "Explore · Map launch→discovery"). Rollup tokens/cost already fold into `session.cost_usd`/totals
+>   via `finalize_usage`, so the parent agent row + fleet live-cost already include sub-agents.
+> - Fleet today/wk/all were CSV-only (`history.csv`, written only at `Finished`) → 0 for never-finished
+>   agents. New `App::fleet_totals()` folds live (active-session) cost+tokens into today/wk/all (skips
+>   `Finished` to avoid double-count); wired into `ui/fleet.rs` strip + `ui/table.rs` title.
+> Tests: `scan_subagents_finds_agent_jsonls_and_splits_active_by_mtime`,
+> `subagents_dir_derives_from_resolved_transcript_path`, `scan_subagents_clears_when_no_subagents_dir`,
+> `resolve_subagent_label_reads_meta_sidecar`, `truncate_label_*`, `fleet_totals_fold_live_spend_and_skip_finished`.
+> Deferred: per-sub-agent **context %** (the rollup accumulates deltas, not last-call absolute context,
+> so the sub-agent rows show cost/tokens but `-` for context); a cap on simultaneous active rows if a
+> wide fan-out ever floods the roster (YAGNI).
+

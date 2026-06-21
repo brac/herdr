@@ -49,25 +49,25 @@ pub fn render_fleet_strip(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(spark(&app.fleet_burn_history), Style::default().fg(t.sparkline)),
     ];
 
-    // Cross-session history (not derivable from the live roster at all).
+    // Cross-session history with live spend folded in (so today/wk aren't stuck at
+    // 0 for agents that never reach Finished, and sub-agent spend is reflected).
     // today/wk cost + wk tokens (BACKLOG "wk token tracker"), then the all-time
     // collection totals (BACKLOG "Persistent cost").
-    let w = &app.weekly_summary;
-    let a = &app.all_time_summary;
+    let totals = app.fleet_totals();
     spans.push(Span::styled(
         format!(
             "   \u{2502}  today ${:.2} \u{00b7} wk ${:.2} ({})",
-            w.today_cost_usd,
-            w.cost_usd,
-            fmt_tokens(w.total_tokens),
+            totals.today_cost,
+            totals.week_cost,
+            fmt_tokens(totals.week_tokens),
         ),
         dim,
     ));
     spans.push(Span::styled(
         format!(
             "   \u{2502}  all ${:.2} ({})",
-            a.cost_usd,
-            fmt_tokens(a.total_tokens),
+            totals.all_cost,
+            fmt_tokens(totals.all_tokens),
         ),
         dim,
     ));

@@ -421,7 +421,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let footer = Line::from(footer_spans);
 
     // Title with weekly summary + recording indicator
-    let ws = &app.weekly_summary;
     let rec_indicator = if !app.session_recordings.is_empty() {
         let count = app.session_recordings.len();
         if count == 1 {
@@ -445,18 +444,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    if ws.cost_usd > 0.0 {
-        let week_cost = if ws.cost_usd < 1.0 {
-            format!("${:.2}", ws.cost_usd)
+    // Live spend folded into the CSV history, so today/week show in-flight work
+    // (incl. sub-agents) instead of only sessions that reached Finished.
+    let totals = app.fleet_totals();
+    if totals.week_cost > 0.0 {
+        let week_cost = if totals.week_cost < 1.0 {
+            format!("${:.2}", totals.week_cost)
         } else {
-            format!("${:.1}", ws.cost_usd)
+            format!("${:.1}", totals.week_cost)
         };
-        let today_cost = if ws.today_cost_usd < 1.0 {
-            format!("${:.2}", ws.today_cost_usd)
+        let today_cost = if totals.today_cost < 1.0 {
+            format!("${:.2}", totals.today_cost)
         } else {
-            format!("${:.1}", ws.today_cost_usd)
+            format!("${:.1}", totals.today_cost)
         };
-        let week_tokens = format_token_count(ws.total_tokens);
+        let week_tokens = format_token_count(totals.week_tokens);
         let eta_str = match app.budget_eta() {
             Some((spent, limit, eta, _urgency)) => {
                 let spent_str = if spent < 1.0 {

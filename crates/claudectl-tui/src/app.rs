@@ -378,6 +378,21 @@ pub struct FleetCounts {
     pub burn_per_hr: f64,
 }
 
+/// History totals for the fleet strip with **live** spend folded in. The CSV-backed
+/// `weekly_summary`/`all_time_summary` only count sessions that reached `Finished`
+/// and were written to `history.csv`; an agent you never let finish (or whose
+/// sub-agents came and went) contributed nothing — which is why the counters read
+/// "constantly 0". Here we add the cost/tokens of currently-live sessions (which
+/// already include their sub-agent rollups, via `monitor::finalize_usage`).
+#[derive(Debug, Clone, Default)]
+pub struct FleetTotals {
+    pub today_cost: f64,
+    pub week_cost: f64,
+    pub week_tokens: u64,
+    pub all_cost: f64,
+    pub all_tokens: u64,
+}
+
 pub struct App {
     pub sessions: Vec<ClaudeSession>,
     /// Parent dir herdr was launched from; the project roster scans this (§2).
@@ -3414,6 +3429,34 @@ impl App {
         c
     }
 
+    /// Today/week/all-time cost + token totals with live (active-session) spend
+    /// folded into the CSV-backed history. See [`FleetTotals`].
+    pub fn fleet_totals(&self) -> FleetTotals {
+        // Live sessions not yet recorded to history. Exclude `Finished` — it may
+        // have just been written to the CSV, so counting it here would double it.
+        let mut live_cost = 0.0;
+        let mut live_tokens = 0u64;
+        for s in &self.sessions {
+            if s.status == SessionStatus::Finished {
+                continue;
+            }
+            live_cost += s.cost_usd;
+            live_tokens += s.total_input_tokens + s.total_output_tokens;
+        }
+
+        let w = &self.weekly_summary;
+        let a = &self.all_time_summary;
+        // Live spend belongs to today, this week, and all-time at once, so it adds
+        // to each (today ⊆ week ⊆ all — consistent, not double-counted).
+        FleetTotals {
+            today_cost: w.today_cost_usd + live_cost,
+            week_cost: w.cost_usd + live_cost,
+            week_tokens: w.total_tokens + live_tokens,
+            all_cost: a.cost_usd + live_cost,
+            all_tokens: a.total_tokens + live_tokens,
+        }
+    }
+
     fn normalize_selection(&mut self) {
         let len = self.roster_len();
         if len == 0 {
@@ -4440,6 +4483,56 @@ mod tests {
             r = smooth_burn(r, 0.0);
         }
         assert!(r < 0.01, "idle rate should decay to ~zero, got {r}");
+    }
+
+    #[test]
+    fn fleet_totals_fold_live_spend_and_skip_finished() {
+        // BACKLOG "today/wk counters constantly 0": history.csv only holds Finished
+        // sessions, so a never-finished agent (and its sub-agents) showed nothing.
+        // fleet_totals folds live spend in; a Finished session is excluded (it may
+        // already be in the CSV — counting it here would double it).
+        let mut app = App::new();
+        let mut live = make_session(
+            1,
+            "live",
+            "sonnet-4.6",
+            SessionStatus::Processing,
+            3.0,
+            10.0,
+            true,
+        );
+        live.total_input_tokens = 1000;
+        live.total_output_tokens = 500;
+        let mut done = make_session(
+            2,
+            "done",
+            "sonnet-4.6",
+            SessionStatus::Finished,
+            9.0,
+            10.0,
+            true,
+        );
+        done.total_input_tokens = 9999;
+        done.total_output_tokens = 9999;
+        app.sessions = vec![live, done];
+        app.weekly_summary = claudectl_core::history::WeeklySummary {
+            cost_usd: 2.0,
+            total_tokens: 4000,
+            today_cost_usd: 1.0,
+            ..Default::default()
+        };
+        app.all_time_summary = claudectl_core::history::AllTimeSummary {
+            cost_usd: 10.0,
+            total_tokens: 50_000,
+            ..Default::default()
+        };
+
+        let t = app.fleet_totals();
+        assert!((t.today_cost - 4.0).abs() < 1e-9, "1.0 today + 3.0 live");
+        assert!((t.week_cost - 5.0).abs() < 1e-9, "2.0 wk + 3.0 live");
+        assert_eq!(t.week_tokens, 4000 + 1500, "wk tokens + live in+out");
+        assert!((t.all_cost - 13.0).abs() < 1e-9, "10.0 all + 3.0 live");
+        assert_eq!(t.all_tokens, 50_000 + 1500);
     }
 
     fn make_test_app() -> App {

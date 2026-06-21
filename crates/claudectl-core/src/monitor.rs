@@ -694,7 +694,9 @@ pub fn shorten_model(model: &str) -> String {
 }
 
 fn refresh_subagent_rollups(session: &mut ClaudeSession) -> UsageRollup {
-    for path in session.active_subagent_jsonl_paths.clone() {
+    // Read *every* discovered subagent (active + completed), so a sub-agent that
+    // started and finished between ticks is still fully attributed to the parent.
+    for path in session.subagent_jsonl_paths.clone() {
         let rollup = session.subagent_rollups.entry(path.clone()).or_default();
         update_subagent_rollup(&path, rollup, &session.model);
     }
@@ -725,6 +727,14 @@ fn update_subagent_rollup(
     let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     if rollup.jsonl_offset > file_len {
         *rollup = SubagentRollup::default();
+    }
+
+    // Resolve the display label once from the `agent-*.meta.json` sidecar
+    // (preserved across the default-reset above, which clears `label`).
+    if rollup.label.is_empty() {
+        if let Some(label) = resolve_subagent_label(path) {
+            rollup.label = label;
+        }
     }
 
     if rollup.jsonl_offset >= file_len {
@@ -789,6 +799,44 @@ fn update_subagent_rollup(
     rollup.jsonl_offset = file_len;
 }
 
+/// Longest a subagent row label may be before we trim it (the roster Project cell
+/// is narrow and already indented two levels under the agent).
+const SUBAGENT_LABEL_MAX: usize = 44;
+
+/// Build a human label for a subagent from its `agent-*.meta.json` sidecar:
+/// `"{agentType} · {description}"` (e.g. "Explore · Map launch→discovery"), trimmed
+/// to [`SUBAGENT_LABEL_MAX`]. Returns `None` when the sidecar is missing/unparseable
+/// (caller then falls back to the file stem).
+fn resolve_subagent_label(jsonl_path: &std::path::Path) -> Option<String> {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    let content = std::fs::read_to_string(&meta_path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+
+    let agent_type = value.get("agentType").and_then(|v| v.as_str()).unwrap_or("");
+    let description = value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let label = match (agent_type.is_empty(), description.is_empty()) {
+        (false, false) => format!("{agent_type} \u{00b7} {description}"),
+        (false, true) => agent_type.to_string(),
+        (true, false) => description.to_string(),
+        (true, true) => return None,
+    };
+
+    Some(truncate_label(&label, SUBAGENT_LABEL_MAX))
+}
+
+/// Trim a label to `max` chars on a char boundary, appending an ellipsis.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let kept: String = label.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
 fn estimate_cost_components(
     model: &str,
     total_input_tokens: u64,
@@ -824,6 +872,39 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    #[test]
+    fn truncate_label_keeps_short_and_ellipsizes_long() {
+        use super::truncate_label;
+        assert_eq!(truncate_label("Explore", 44), "Explore");
+        let long = "Explore \u{00b7} ".to_string() + &"x".repeat(80);
+        let out = truncate_label(&long, 44);
+        assert_eq!(out.chars().count(), 44);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn resolve_subagent_label_reads_meta_sidecar() {
+        use super::resolve_subagent_label;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("agent-abc.jsonl");
+        std::fs::File::create(&jsonl).unwrap();
+        std::fs::File::create(dir.path().join("agent-abc.meta.json"))
+            .unwrap()
+            .write_all(br#"{"agentType":"Explore","description":"Map launch flow","toolUseId":"t"}"#)
+            .unwrap();
+
+        assert_eq!(
+            resolve_subagent_label(&jsonl).as_deref(),
+            Some("Explore \u{00b7} Map launch flow")
+        );
+
+        // No sidecar → None (caller falls back to the file stem).
+        let orphan = dir.path().join("agent-xyz.jsonl");
+        std::fs::File::create(&orphan).unwrap();
+        assert_eq!(resolve_subagent_label(&orphan), None);
     }
 
     #[test]

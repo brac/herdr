@@ -162,7 +162,11 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  Needs Input ", Style::default().fg(t.status_needs_input)),
-            Span::raw("  Blocked on user approval/input"),
+            Span::raw("  Blocked on user approval/input — your action needed"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Error       ", Style::default().fg(t.status_error)),
+            Span::raw("  Last turn hit an API error (an active retry stays Processing)"),
         ]),
         Line::from(vec![
             Span::styled("  Processing  ", Style::default().fg(t.status_processing)),
@@ -170,7 +174,11 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  Waiting     ", Style::default().fg(t.status_waiting)),
-            Span::raw("  Done responding, awaiting next prompt"),
+            Span::raw("  Blocked on the API — a request is in flight"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Job Done    ", Style::default().fg(t.status_job_done)),
+            Span::raw("  Turn complete, your move — counts as idle in the fleet strip"),
         ]),
         Line::from(vec![
             Span::styled("  Unknown     ", Style::default().fg(t.status_unknown)),
@@ -178,7 +186,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  Idle        ", Style::default().fg(t.status_idle)),
-            Span::raw("  No recent activity"),
+            Span::raw("  No recent activity (stale Job Done / parked tool call)"),
         ]),
         Line::from(vec![
             Span::styled("  Finished    ", Style::default().fg(t.status_finished)),
@@ -196,11 +204,23 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  +N ", Style::default().fg(t.highlight_key)),
-            Span::raw("after project = N sub-agents tracked"),
+            Span::raw("after agent = N sub-agents tracked (cost folded into the parent)"),
         ]),
         Line::from(vec![
             Span::styled("  !! ", Style::default().fg(t.highlight_key)),
-            Span::raw("before project = directory conflict"),
+            Span::raw("before agent = 2+ agents share this git worktree (conflict risk)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  !F ", Style::default().fg(t.highlight_key)),
+            Span::raw("before agent = agents are editing the same file(s)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  REC ", Style::default().fg(t.highlight_key)),
+            Span::raw("before agent = recording a highlight reel (R toggles)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  \u{26a0}N \u{2715}N ", Style::default().fg(t.highlight_key)),
+            Span::raw("on a project header = N agents awaiting approval / in error"),
         ]),
         Line::from(vec![
             Span::styled("  (Xm Xs) ", Style::default().fg(t.highlight_key)),

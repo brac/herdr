@@ -3420,9 +3420,11 @@ impl App {
                 // Both want the user: an approval prompt or an API error to recover from.
                 SessionStatus::NeedsInput | SessionStatus::Error => c.needs_input += 1,
                 SessionStatus::Processing => c.processing += 1,
-                // Waiting on the API, or job done awaiting the next task — not engaged-busy.
-                SessionStatus::WaitingInput | SessionStatus::JobDone => c.waiting += 1,
-                // Idle/Unknown/Finished all read as "not currently engaged".
+                // "wait" = genuinely blocked on the API (a request is in flight).
+                SessionStatus::WaitingInput => c.waiting += 1,
+                // Job Done = turn complete, your move — the agent isn't doing anything,
+                // so it counts as idle (BACKLOG "Job Done should be idle +1"), alongside
+                // Idle/Unknown/Finished.
                 _ => c.idle += 1,
             }
         }
@@ -5091,6 +5093,21 @@ mod tests {
         assert_eq!(f.waiting, 1);
         assert_eq!(f.idle, 1);
         assert!((f.burn_per_hr - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fleet_counts_job_done_reads_as_idle_not_waiting() {
+        // BACKLOG "Job Done should be idle +1": a finished-turn agent isn't doing
+        // anything, so it joins the idle bucket — only a real in-flight API request
+        // (WaitingInput) counts as "wait".
+        let mut app = App::new();
+        let w = make_session(1, "w", "opus", SessionStatus::WaitingInput, 0.0, 0.0, true);
+        let j = make_session(2, "j", "opus", SessionStatus::JobDone, 0.0, 0.0, true);
+        app.sessions = vec![w, j];
+
+        let f = app.fleet_counts();
+        assert_eq!(f.waiting, 1, "only the in-flight API request counts as wait");
+        assert_eq!(f.idle, 1, "job done counts as idle");
     }
 
     #[test]

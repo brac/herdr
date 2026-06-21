@@ -48,6 +48,8 @@ pub enum TranscriptEvent {
 }
 
 pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
+    maybe_capture_limit_notice(line);
+
     let entry: Value = serde_json::from_str(line).ok()?;
 
     if is_waiting_for_task(&entry) {
@@ -93,6 +95,35 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     }))
+}
+
+/// BACKLOG "session limit notice": Claude Code's exact "approaching / over usage
+/// limit" transcript wording isn't verified yet (the D2 quota work was deferred for
+/// lack of a real sample). Until we have one, log the full line whenever it smells
+/// like a limit notice. It's a no-op unless the logger is initialized (`HERDR_LOG`),
+/// and the `contains("limit")` fast-reject keeps it off the hot path otherwise — so
+/// the next real occurrence is captured verbatim for a follow-up that adds a verified
+/// regex → status flag → roster badge. No status/UI behavior is changed here.
+fn maybe_capture_limit_notice(line: &str) {
+    // Cheap reject first: the vast majority of transcript lines never say "limit".
+    if !line.contains("limit") && !line.contains("Limit") {
+        return;
+    }
+    // Discriminating phrases — narrow enough to skip ordinary code/tool output that
+    // merely contains the word "limit".
+    const NEEDLES: [&str; 6] = [
+        "usage limit",
+        "rate limit",
+        "limit reached",
+        "limit will reset",
+        "approaching your",
+        "reset at",
+    ];
+    let lower = line.to_ascii_lowercase();
+    if NEEDLES.iter().any(|n| lower.contains(n)) {
+        let snippet: String = line.chars().take(2000).collect();
+        crate::logger::log("LIMIT", &format!("possible session-limit notice: {snippet}"));
+    }
 }
 
 fn is_waiting_for_task(entry: &Value) -> bool {

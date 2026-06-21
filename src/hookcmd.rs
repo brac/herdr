@@ -65,12 +65,24 @@ pub fn run(sub: Option<&str>) -> i32 {
 
 /// Absolute path to this binary + the subcommand, so the registered hook works
 /// regardless of PATH and stays valid across rebuilds.
+///
+/// Claude Code runs hook commands through `/bin/sh -c`, so the binary path must be
+/// shell-quoted — otherwise a path with spaces (e.g. `/mnt/c/Users/Ben Bracamonte/…`)
+/// is word-split and `sh` reports `/mnt/c/Users/Ben: not found`. The `hook notify`
+/// suffix stays bare so `hookstate::is_ours` still recognizes (and on re-install
+/// replaces) both this and any older unquoted entry.
 fn hook_command() -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "herdr".into());
-    format!("{exe} hook notify")
+    format!("{} hook notify", shell_single_quote(&exe))
+}
+
+/// Wrap a string in POSIX single quotes, escaping any embedded single quote as the
+/// canonical `'\''`. Safe against spaces and all shell metacharacters for `sh -c`.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn status() -> i32 {
@@ -98,4 +110,32 @@ fn status() -> i32 {
         Err(_) => println!("  (dir not present \u{2014} hooks not installed or never fired)"),
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quotes_paths_with_spaces() {
+        // The bug: an unquoted path with a space was word-split by `sh -c`, so
+        // `/mnt/c/Users/Ben Bracamonte/…/herdr` ran as just `/mnt/c/Users/Ben`.
+        let q = shell_single_quote("/mnt/c/Users/Ben Bracamonte/Work/herdr/target/release/herdr");
+        assert_eq!(
+            q,
+            "'/mnt/c/Users/Ben Bracamonte/Work/herdr/target/release/herdr'"
+        );
+    }
+
+    #[test]
+    fn escapes_embedded_single_quotes() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn command_keeps_bare_hook_notify_suffix() {
+        // `hookstate::is_ours` recognizes our entry by this suffix, so re-install can
+        // replace an older unquoted one. The suffix must stay outside the quotes.
+        assert!(hook_command().ends_with(" hook notify"));
+    }
 }

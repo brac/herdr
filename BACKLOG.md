@@ -292,8 +292,16 @@ COMPARABLES §7 tail.
 >   safety tick), so it's near-always fresh; a staleness indicator (valuable for vscode-claude-status's
 >   *network* panel) would read "now" almost always here. Low value.
 
-## Bug: If an anget process Job Done then the fleet count should be idle +1
+## Bug: If an anget process Job Done then the fleet count should be idle +1 - DONE
 what is the difference between idle and waitign anyway? And jobs done? I feel like I am conflating terms
+> Resolved: `fleet_counts` (`app.rs`) lumped **Job Done** into the `wait` bucket alongside
+> WaitingInput; it now counts as **idle** — a finished-turn agent isn't doing anything, it's your
+> move. So `wait` is *only* a genuine in-flight API request (WaitingInput). The taxonomy: **Processing**
+> = working · **Waiting** = blocked on the API (request in flight) · **Job Done** = turn complete, your
+> move · **Idle** = no recent activity (stale Job Done / parked tool call) · **Needs Input** = approval ·
+> **Error** = API error. Added this glossary + the `!!`/`!F`/`REC`/`⚠N`/`✕N` indicator legend to the `?`
+> help overlay (`ui/help.rs`) so the terms are discoverable. Test
+> `fleet_counts_job_done_reads_as_idle_not_waiting`.
 
 ## Bug: Approve / Deny not visible on roster view
 I think we have the functionlailty but I don't see any notification that an agent is asking for approve deny or some other reponse from the user before proceeding. If its just approve deny then I would like to be able to anserw that from the roster view. Other questions the user needs to go to the claude window for more details
@@ -301,8 +309,18 @@ I think we have the functionlailty but I don't see any notification that an agen
 ## Feature: Color the agents in roster
 The agent names, which seem to be just the same as the project that they were stated on are just regualr gray. Can we use a more poppy dracula themeed color? I want those to stand out more
 
-## Bug: Is that hooks thing installed?
+## Bug: Is that hooks thing installed? - PARTIAL (install works; bug fixed)
 I thgouth that we had a hook to tell when an agent does stuff so we could more relaiably determine when an agent needs direction or is done with the job etc. How do we install that? target/release/herd install ?
+> Install it with **`herdr hook install`** (then restart Claude Code sessions); it merges opt-in
+> `Notification`/`Stop` hooks into `~/.claude/settings.json` and `herdr hook status` shows the live state.
+> Fixed a blocker found here: `hook_command` wrote the binary path **unquoted**, so Claude Code's
+> `/bin/sh -c` word-split a path with spaces (`/mnt/c/Users/Ben Bracamonte/…` → `/bin/sh: /mnt/c/Users/Ben:
+> not found`) and the hook silently failed. Now shell-single-quoted (`shell_single_quote`); the bare
+> `hook notify` suffix lets re-install replace the old broken entry. **Re-run `herdr hook install` once**
+> to repair an existing install. Tests `quotes_paths_with_spaces`, `escapes_embedded_single_quotes`,
+> `command_keeps_bare_hook_notify_suffix`. Also wired groundwork for the (deferred) session-limit notice:
+> `transcript::maybe_capture_limit_notice` logs a real "usage limit" line under `HERDR_LOG` so a verified
+> regex/badge can follow.
 
 ## Bug: Sub-agents never appeared in the roster + their tokens vanished - DONE
 When an agent spawns sub-agents (e.g. Explore agents in a code review), I want them tabbed under the

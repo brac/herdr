@@ -461,13 +461,15 @@ fn apply_hook_override(session: &mut ClaudeSession) {
     }
 
     match state.status {
-        // A real retry/continuation (Processing) or an active API error outranks a
-        // "needs input" hint; otherwise the hook makes NeedsInput a fact.
+        // A fresh Notification means the agent is blocked on the user — make it a
+        // fact. It outranks the heuristic's inferred status, INCLUDING the low-CPU
+        // "Processing" the tool_use branch now reports during a just-called tool's
+        // grace window, so a real permission prompt still surfaces instantly when
+        // hooks are on. It defers only to a visibly-busy agent (high CPU = really
+        // working, so the hook must be stale/superseded) or an active Error.
         HookStatus::NeedsInput => {
-            if !matches!(
-                session.status,
-                SessionStatus::Processing | SessionStatus::Error
-            ) {
+            let busy = session.cpu_percent > 5.0;
+            if !busy && session.status != SessionStatus::Error {
                 session.status = SessionStatus::NeedsInput;
             }
         }
@@ -494,6 +496,17 @@ const IDLE_AFTER_MINS: u64 = 10;
 /// on a tool call, parking the transcript at a tool_result) → Waiting, not a
 /// permanent false Processing.
 const USER_LINE_PROCESSING_GRACE_SECS: u64 = 10;
+/// How long (seconds) a tool call must sit outstanding with the agent idle (CPU
+/// low) before the heuristic calls it NeedsInput. An auto-approved tool that is
+/// merely *executing* (a long Bash/web call) looks identical to a permission
+/// prompt from CPU + JSONL alone — the Claude process is idle while the tool
+/// runs — so flipping to NeedsInput the instant a tool is called flickers: it
+/// flashes NeedsInput, then snaps back to Processing when the ToolResult lands.
+/// Waiting out a normal tool round-trip suppresses that false positive (BACKLOG
+/// "Needs Input then it changes to processing"). The inbound Notification hook,
+/// when installed, makes a real permission prompt instant and authoritative
+/// (see `apply_hook_override`), so this gate only governs the no-hook heuristic.
+const NEEDS_INPUT_STALE_SECS: u64 = 10;
 
 pub fn infer_status(
     session: &mut ClaudeSession,
@@ -550,30 +563,36 @@ pub fn infer_status(
     }
 
     if last_msg_type == "assistant" && last_stop_reason == "tool_use" {
-        // Claude called a tool. If CPU is low, it's likely waiting for user to
-        // approve/deny the tool (permission prompt). The permission prompt doesn't
-        // emit waiting_for_task — detect via CPU + pending tool state or age.
-        //
-        // Primary signal: if pending_tool_name is set (ToolUse parsed but no ToolResult
-        // yet), the session is blocked on a permission prompt regardless of timing.
-        // Fallback: low CPU + age > 5s for cases where the tool was auto-approved
-        // but JSONL hasn't caught up yet.
-        let has_pending_tool = session.pending_tool_name.is_some();
-
-        if session.cpu_percent < 2.0 && has_pending_tool {
-            session.status = SessionStatus::NeedsInput;
-        } else if session.cpu_percent < 2.0 {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let age_secs = (now_ms.saturating_sub(session.last_message_ts)) / 1000;
-            if age_secs > 5 {
+        // Claude called a tool. If CPU is non-trivial it's actively working the
+        // tool/result → Processing (the cpu>5 fast path above already claimed
+        // streaming; this tighter 2.0 cutoff is the "idle enough to be blocked"
+        // line). Otherwise the agent is idle with a tool call outstanding.
+        if session.cpu_percent >= 2.0 {
+            session.status = SessionStatus::Processing;
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let age_secs = (now_ms.saturating_sub(session.last_message_ts)) / 1000;
+        if session.pending_tool_name.is_some() {
+            // A ToolUse with no ToolResult yet, agent idle: EITHER a permission
+            // prompt (truly blocked on the user) OR an auto-approved tool still
+            // executing. Indistinguishable from CPU + JSONL alone, so don't cry
+            // NeedsInput until the call has outlived a normal round-trip — this
+            // is the fix for the "NeedsInput flashes then flips to Processing"
+            // bug. Hooks, when installed, surface a real prompt instantly anyway.
+            if age_secs > NEEDS_INPUT_STALE_SECS {
                 session.status = SessionStatus::NeedsInput;
             } else {
                 session.status = SessionStatus::Processing;
             }
+        } else if age_secs / 60 > IDLE_AFTER_MINS {
+            // No tool outstanding (result already in) and long idle → Idle.
+            session.status = SessionStatus::Idle;
         } else {
+            // Result in, model composing its next message → Processing.
             session.status = SessionStatus::Processing;
         }
         return;
@@ -1023,6 +1042,42 @@ mod tests {
         s.last_message_ts = now_ms(); // just finished
         infer_status(&mut s, "assistant", "end_turn", false, false);
         assert_eq!(s.status, SessionStatus::JobDone);
+    }
+
+    #[test]
+    fn fresh_pending_tool_reads_as_processing_not_needs_input() {
+        // BACKLOG "Needs Input then it changes to processing": a just-called tool
+        // (auto-approved, still executing) must NOT flash NeedsInput. Idle CPU +
+        // an outstanding tool within the round-trip window stays Processing.
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.pending_tool_name = Some("Bash".into());
+        s.last_message_ts = now_ms().saturating_sub(2_000); // 2s ago, within window
+        infer_status(&mut s, "assistant", "tool_use", false, false);
+        assert_eq!(s.status, SessionStatus::Processing);
+    }
+
+    #[test]
+    fn aged_pending_tool_reads_as_needs_input() {
+        // A tool that has sat outstanding past a normal round-trip with the agent
+        // idle is a genuine permission prompt → NeedsInput.
+        let mut s = idle_session();
+        s.cpu_percent = 0.0;
+        s.pending_tool_name = Some("Bash".into());
+        s.last_message_ts = now_ms().saturating_sub(30_000); // 30s ago
+        infer_status(&mut s, "assistant", "tool_use", false, false);
+        assert_eq!(s.status, SessionStatus::NeedsInput);
+    }
+
+    #[test]
+    fn busy_pending_tool_reads_as_processing() {
+        // Real CPU at an outstanding tool means it's working, regardless of age.
+        let mut s = idle_session();
+        s.cpu_percent = 12.0;
+        s.pending_tool_name = Some("Bash".into());
+        s.last_message_ts = now_ms().saturating_sub(30_000);
+        infer_status(&mut s, "assistant", "tool_use", false, false);
+        assert_eq!(s.status, SessionStatus::Processing);
     }
 
     #[test]

@@ -354,3 +354,39 @@ were also constantly 0.
 > so the sub-agent rows show cost/tokens but `-` for context); a cap on simultaneous active rows if a
 > wide fan-out ever floods the roster (YAGNI).
 
+## Bug: Total cost over day/week and heatmap do not persist across sessions - DONE (already shipped)
+Those totals should be stored somewhere locally and loaded in when the app starts. I would like to keep that tally running
+> Already implemented in `77437e5` ("Bug fixes", 2026-06-21): a session-keyed **ledger** at
+> `~/.local/share/claudectl/ledger.json` (`core/history.rs`, `struct Ledger`). It's loaded on startup
+> (`App::with_parent` → `Ledger::load`, seeded once from the legacy `history.csv` on first run),
+> upserted from every live session each tick, and atomically saved (tmp+rename) every ~30s and on quit
+> (`save_tally`, wired at `main.rs:193`). today/wk/all-time **and** the 14-day heatmap all derive from it
+> (`weekly_summary`/`all_time_summary`/`daily_activity`), so the running tally survives restarts. **If
+> you still saw it reset, you were on a stale binary — rebuild via `./quickstart.sh` or
+> `cargo run --release`.** Verified by the workspace test suite (245 green).
+
+## Bug: No more auto sort active agents - DONE (already shipped)
+Once a repo has an active agent in it, don't auto store the roster by statss or whatever. Sort it alphabetically by repo name once 
+there is an active agent in one and it has been brought to the top of the roster. Don't auto sorts those at the top over and over, just
+alphebecially
+> Already implemented in `77437e5`: `App::project_groups` (`app.rs:4189`) sorts agent-bearing repos to
+> the top, then **stable alphabetical by name** — and *deliberately not* by status/urgency/cost, so a
+> repo's position no longer re-floats as its agent churns NeedsInput→Processing→Idle. Ordering only
+> shifts when a repo gains or loses its first/last agent. (Default view is grouped; sticky selection
+> via `RosterSelKey` keeps the cursor on the same repo across any re-sort.) Same stale-binary caveat as
+> above if you still saw rows jumping.
+
+## Bug: A see a diaplay of Needs Input then it changes to processing - DONE
+Needs Input somteimes shows up in the status. I would think that we have a better way of telling for sure if 
+an agent needs input or not. Right now it seems to infer it incorrectly 
+> Resolved: the flicker was the `tool_use` branch in `infer_status` (`monitor.rs`) flipping to
+> **NeedsInput the instant** a tool was outstanding with low CPU — which is indistinguishable from an
+> auto-approved tool still *executing* (the Claude process is idle while a Bash/web call runs), so it
+> flashed NeedsInput then snapped back to Processing when the ToolResult landed. Now an outstanding tool
+> must outlive a normal round-trip (`NEEDS_INPUT_STALE_SECS = 10`) before the heuristic calls it
+> NeedsInput; within that window it stays Processing. To keep accuracy when the inbound hook *is*
+> installed, `apply_hook_override` now lets a fresh `Notification` (NeedsInput) override that low-CPU
+> Processing too (deferring only to a visibly-busy CPU>5 agent or an active Error), so a real permission
+> prompt still surfaces instantly. Tests `fresh_pending_tool_reads_as_processing_not_needs_input`,
+> `aged_pending_tool_reads_as_needs_input`, `busy_pending_tool_reads_as_processing`. The authoritative
+> path remains `herdr hook install` (status from fact, not guess).

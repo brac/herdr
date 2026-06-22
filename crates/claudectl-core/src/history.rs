@@ -486,6 +486,226 @@ fn aggregate_all_time(records: &[SessionRecord]) -> AllTimeSummary {
     summary
 }
 
+// ─── Persistent running tally (the cost ledger) ──────────────────────────────
+//
+// The fleet strip's day/week/all-time totals and the activity heatmap must
+// **survive restarts** — a running tally, not a per-launch one. The legacy
+// `history.csv` only ever captured a session at the instant it reached
+// `Finished` (rare for interactive agents), so those counters effectively reset
+// every launch. The ledger fixes that: it stores the latest-known cost for
+// **every** session keyed by Claude Code's stable `session_id`, upserted on
+// every refresh (live sessions included). Re-observing a session — next tick or
+// after a herdr restart — overwrites its entry instead of appending, so the
+// tally is never double-counted and a crash loses at most one save interval.
+// `history.csv` stays put as the CLI `history`/`stats` archive (§ `print_*`).
+
+use std::collections::HashMap;
+
+/// One session's latest-known usage, as persisted in the ledger. Serialized as
+/// the value of a `session_id → entry` JSON map.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LedgerEntry {
+    /// Session start, epoch **milliseconds** (matches `ClaudeSession::started_at`).
+    /// The session's whole cost is attributed to this day in the heatmap/day
+    /// buckets — consistent with how `history.csv` bucketed by record time.
+    pub started_at_ms: u64,
+    pub project: String,
+    pub model: String,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// The persistent cost tally. Entries are keyed by `session_id`; summaries are
+/// derived on demand (cheap in-memory folds). Disk writes are throttled by the
+/// caller (the TUI saves every ~30s and on quit).
+#[derive(Debug, Clone, Default)]
+pub struct Ledger {
+    entries: HashMap<String, LedgerEntry>,
+    /// On-disk location, or `None` for an ephemeral ledger (tests / demo) that
+    /// never touches disk — so unit tests can't clobber the real tally.
+    path: Option<PathBuf>,
+    /// Set on `upsert`/seed; cleared on a successful `save`. Skips no-op writes.
+    dirty: bool,
+}
+
+fn ledger_path() -> PathBuf {
+    history_dir().join("ledger.json")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// One-time migration: turn the legacy `history.csv` archive into ledger entries
+/// so an existing user keeps their accrued tally. Synthetic keys (`csv:<n>`) —
+/// those rows have no `session_id` — and they never collide with live sessions
+/// (a CSV row is a *finished* session whose process is long gone), so seeding is
+/// safe. Runs only when `ledger.json` is absent; thereafter the ledger owns it.
+fn seed_from_csv() -> HashMap<String, LedgerEntry> {
+    load_history(None)
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                format!("csv:{i}"),
+                LedgerEntry {
+                    started_at_ms: parse_timestamp_epoch(&r.timestamp).unwrap_or(0) * 1000,
+                    project: r.project,
+                    model: r.model,
+                    cost_usd: r.cost_usd,
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                },
+            )
+        })
+        .collect()
+}
+
+impl Ledger {
+    /// Load the persistent ledger from `~/.local/share/claudectl/ledger.json`.
+    /// On first run (file absent) seed from the legacy CSV; a corrupt/partial
+    /// file degrades to empty rather than crashing (CLAUDE.md: defensive parsing).
+    pub fn load() -> Self {
+        let path = ledger_path();
+        match fs::read_to_string(&path) {
+            Ok(s) => Ledger {
+                entries: serde_json::from_str(&s).unwrap_or_default(),
+                path: Some(path),
+                dirty: false,
+            },
+            Err(_) => Ledger {
+                entries: seed_from_csv(),
+                path: Some(path),
+                dirty: true, // persist the one-time CSV migration on the next save
+            },
+        }
+    }
+
+    /// An in-memory ledger that never writes to disk (tests, demo mode).
+    pub fn ephemeral() -> Self {
+        Ledger::default()
+    }
+
+    /// Record a session's **current** totals, keyed by its stable session id.
+    /// Idempotent: the latest call for a given id wins. Sessions without an id
+    /// are skipped (nothing stable to key on).
+    pub fn upsert(&mut self, s: &crate::session::ClaudeSession) {
+        self.record(
+            &s.session_id,
+            LedgerEntry {
+                started_at_ms: s.started_at,
+                project: s.display_name().to_string(),
+                model: s.model.clone(),
+                cost_usd: s.cost_usd,
+                input_tokens: s.total_input_tokens,
+                output_tokens: s.total_output_tokens,
+            },
+        );
+    }
+
+    /// The keying core of [`upsert`], split out so it's testable without
+    /// constructing a full `ClaudeSession`.
+    fn record(&mut self, session_id: &str, mut entry: LedgerEntry) {
+        if session_id.is_empty() {
+            return;
+        }
+        // Keep the earliest-seen start so the heatmap's start-day bucket is stable
+        // across the many re-observations of a long-running session.
+        if let Some(existing) = self.entries.get(session_id) {
+            if existing.started_at_ms != 0 {
+                entry.started_at_ms = existing.started_at_ms;
+            }
+        }
+        self.entries.insert(session_id.to_string(), entry);
+        self.dirty = true;
+    }
+
+    /// Persist to disk if backed by a real path and changed since the last save.
+    /// Atomic (tmp + rename) so a crash mid-write can't corrupt the tally.
+    pub fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let Some(path) = self.path.clone() else { return };
+        let Some(dir) = path.parent() else { return };
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let Ok(json) = serde_json::to_string(&self.entries) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, json.as_bytes()).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            self.dirty = false;
+        }
+    }
+
+    /// Daily + weekly totals, derived from the ledger (windowed on each session's
+    /// start time). Mirrors the legacy [`weekly_summary`] shape.
+    pub fn weekly_summary(&self) -> WeeklySummary {
+        let now = now_secs();
+        let mut s = WeeklySummary::default();
+        for e in self.entries.values() {
+            let age = now.saturating_sub(e.started_at_ms / 1000);
+            if age <= 7 * 86400 {
+                s.cost_usd += e.cost_usd;
+                s.total_tokens += e.input_tokens + e.output_tokens;
+                s.session_count += 1;
+            }
+            if age <= 86400 {
+                s.today_cost_usd += e.cost_usd;
+            }
+        }
+        s
+    }
+
+    /// All-time totals (collection-wide + per project) across every ledger entry.
+    pub fn all_time_summary(&self) -> AllTimeSummary {
+        let mut s = AllTimeSummary::default();
+        for e in self.entries.values() {
+            let tokens = e.input_tokens + e.output_tokens;
+            s.cost_usd += e.cost_usd;
+            s.total_tokens += tokens;
+            s.session_count += 1;
+            let p = s.per_project.entry(e.project.clone()).or_default();
+            p.cost_usd += e.cost_usd;
+            p.total_tokens += tokens;
+            p.session_count += 1;
+        }
+        s
+    }
+
+    /// Per-day cost for the last `days` days, oldest→newest, zero-filled — the
+    /// ledger-backed twin of [`daily_cost_series`].
+    fn daily_cost_series(&self, days: usize) -> Vec<f64> {
+        if days == 0 {
+            return Vec::new();
+        }
+        let today = now_secs() / 86_400;
+        let mut series = vec![0.0; days];
+        for e in self.entries.values() {
+            let day = (e.started_at_ms / 1000) / 86_400;
+            if day > today {
+                continue;
+            }
+            let back = (today - day) as usize;
+            if back < days {
+                series[days - 1 - back] += e.cost_usd;
+            }
+        }
+        series
+    }
+
+    /// Activity-heatmap intensity levels for the last `days` days.
+    pub fn daily_activity(&self, days: usize) -> Vec<u8> {
+        intensities(&self.daily_cost_series(days))
+    }
+}
+
 /// Parse a duration string like "24h", "30m", "7d" into seconds.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -605,5 +825,87 @@ mod tests {
         assert_eq!(alpha.total_tokens, 450);
         assert_eq!(s.project("beta").unwrap().total_tokens, 15);
         assert!(s.project("missing").is_none());
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    impl Ledger {
+        fn from_entries(entries: HashMap<String, LedgerEntry>) -> Self {
+            Ledger {
+                entries,
+                path: None,
+                dirty: false,
+            }
+        }
+    }
+
+    fn entry(project: &str, started_at_ms: u64, cost: f64, tokens: u64) -> LedgerEntry {
+        LedgerEntry {
+            started_at_ms,
+            project: project.into(),
+            model: "sonnet".into(),
+            cost_usd: cost,
+            input_tokens: tokens,
+            output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn all_time_summary_rolls_up_every_entry_regardless_of_age() {
+        // Two old, one recent — all-time counts them all.
+        let entries = HashMap::from([
+            ("s1".into(), entry("alpha", 0, 1.0, 100)),
+            ("s2".into(), entry("alpha", 0, 2.0, 200)),
+            ("s3".into(), entry("beta", 0, 0.5, 50)),
+        ]);
+        let s = Ledger::from_entries(entries).all_time_summary();
+        assert_eq!(s.session_count, 3);
+        assert!((s.cost_usd - 3.5).abs() < 1e-9);
+        assert_eq!(s.total_tokens, 350);
+        assert!((s.project("alpha").unwrap().cost_usd - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weekly_summary_windows_today_and_week_by_start_time() {
+        let now_ms = now_secs() * 1000;
+        let day_ago = now_ms - 2 * 86_400 * 1000; // within week, not today
+        let month_ago = now_ms - 30 * 86_400 * 1000; // outside the week
+        let entries = HashMap::from([
+            ("today".into(), entry("a", now_ms, 1.0, 10)),
+            ("thisweek".into(), entry("a", day_ago, 2.0, 20)),
+            ("old".into(), entry("a", month_ago, 4.0, 40)),
+        ]);
+        let s = Ledger::from_entries(entries).weekly_summary();
+        assert!((s.today_cost_usd - 1.0).abs() < 1e-9, "only today's session");
+        assert!((s.cost_usd - 3.0).abs() < 1e-9, "today + this-week, not month");
+        assert_eq!(s.total_tokens, 30);
+    }
+
+    #[test]
+    fn upsert_is_idempotent_by_session_id() {
+        // Re-observing the same session (rising cost) overwrites, never doubles.
+        let mut ledger = Ledger::ephemeral();
+        ledger.record("abc", entry("proj", 0, 1.0, 100));
+        ledger.record("abc", entry("proj", 0, 2.5, 250)); // same id, more spend
+        let summary = ledger.all_time_summary();
+        assert_eq!(summary.session_count, 1, "one session, not two");
+        assert!((summary.cost_usd - 2.5).abs() < 1e-9, "latest cost wins");
+        assert_eq!(summary.total_tokens, 250);
+
+        // A blank session id is unkeyable — skipped.
+        ledger.record("", entry("proj", 0, 9.0, 0));
+        assert_eq!(ledger.all_time_summary().session_count, 1);
+    }
+
+    #[test]
+    fn ephemeral_ledger_never_writes() {
+        let mut ledger = Ledger::ephemeral();
+        ledger.record("x", entry("proj", 0, 1.0, 10));
+        assert!(ledger.dirty);
+        ledger.save(); // no path → no-op, stays dirty
+        assert!(ledger.dirty, "ephemeral save is a no-op");
     }
 }

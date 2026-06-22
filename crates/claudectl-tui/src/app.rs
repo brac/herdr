@@ -378,12 +378,12 @@ pub struct FleetCounts {
     pub burn_per_hr: f64,
 }
 
-/// History totals for the fleet strip with **live** spend folded in. The CSV-backed
-/// `weekly_summary`/`all_time_summary` only count sessions that reached `Finished`
-/// and were written to `history.csv`; an agent you never let finish (or whose
-/// sub-agents came and went) contributed nothing — which is why the counters read
-/// "constantly 0". Here we add the cost/tokens of currently-live sessions (which
-/// already include their sub-agent rollups, via `monitor::finalize_usage`).
+/// History totals for the fleet strip. Sourced from the persistent
+/// [`claudectl_core::history::Ledger`] (via `weekly_summary`/`all_time_summary`),
+/// which holds the latest cost of **every** session — live and finished — keyed
+/// by session id and reloaded on launch. So these counters reflect in-flight
+/// spend *and* survive restarts, fixing the old "constantly 0" behaviour where
+/// only sessions that reached `Finished` (rare for interactive agents) counted.
 #[derive(Debug, Clone, Default)]
 pub struct FleetTotals {
     pub today_cost: f64,
@@ -476,6 +476,15 @@ pub struct App {
     /// it never reads `history.csv` on the render path (Phase D / docs/COMPARABLES §7).
     pub daily_activity: Vec<u8>,
     pub weekly_summary_tick: u32, // Refresh every N ticks
+    /// Persistent running cost tally (the source of the three summaries above):
+    /// every tracked session's latest cost, keyed by session id, upserted each
+    /// tick and reloaded on launch so the day/week/all-time totals + heatmap
+    /// survive restarts. See [`claudectl_core::history::Ledger`].
+    pub ledger: claudectl_core::history::Ledger,
+    /// Whether the ledger is allowed to write to disk. `true` on the live
+    /// `with_parent` path; `false` for the test/default `App::new()` so unit
+    /// tests can never clobber the real on-disk tally.
+    pub persist_enabled: bool,
     pub hooks: HookRegistry,
     pub daily_limit: Option<f64>,
     pub weekly_limit: Option<f64>,
@@ -733,12 +742,26 @@ fn observation_from(
 
 impl App {
     pub fn new() -> Self {
-        Self::with_parent(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        let mut app =
+            Self::with_parent(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // Tests/default: an empty, never-persisting ledger and clean summaries,
+        // so unit tests neither read real history into their assertions nor write
+        // the on-disk tally.
+        app.ledger = claudectl_core::history::Ledger::ephemeral();
+        app.persist_enabled = false;
+        app.weekly_summary = Default::default();
+        app.all_time_summary = Default::default();
+        app.daily_activity = Default::default();
+        app
     }
 
     /// Construct against a specific parent directory (the project roster root).
     /// `new()` delegates here with the process's current dir.
     pub fn with_parent(parent_dir: PathBuf) -> Self {
+        // The persistent tally: loaded once here so the fleet strip's totals and
+        // heatmap pick up where the last run left off (CLAUDE.md: counters must
+        // survive restarts). All three summaries are derived from it.
+        let ledger = claudectl_core::history::Ledger::load();
         let mut app = Self {
             sessions: Vec::new(),
             parent_dir,
@@ -789,12 +812,12 @@ impl App {
             budget_warned: HashSet::new(),
             budget_killed: HashSet::new(),
             theme: Theme::from_mode(claudectl_core::theme::ThemeMode::Dark),
-            weekly_summary: claudectl_core::history::weekly_summary(),
-            all_time_summary: claudectl_core::history::all_time_summary(),
-            daily_activity: claudectl_core::history::daily_activity(
-                claudectl_core::history::ACTIVITY_DAYS,
-            ),
+            weekly_summary: ledger.weekly_summary(),
+            all_time_summary: ledger.all_time_summary(),
+            daily_activity: ledger.daily_activity(claudectl_core::history::ACTIVITY_DAYS),
             weekly_summary_tick: 0,
+            ledger,
+            persist_enabled: true,
             hooks: HookRegistry::new(),
             daily_limit: None,
             weekly_limit: None,
@@ -1794,15 +1817,41 @@ impl App {
         // Check idle mode transition
         self.check_idle_mode();
 
-        // Refresh weekly summary every ~30s (15 ticks at 2s interval)
+        // Persistent running tally. Upsert every tracked session's *current* cost
+        // into the ledger (keyed by session id — live sessions included), then
+        // derive the day/week/all-time totals + heatmap from it. Because live
+        // spend is in the ledger, the totals need no separate "live fold" and
+        // they survive restarts (the ledger is reloaded in `with_parent`).
+        // Recompute is a cheap in-memory fold, so it runs every tick for instant
+        // freshness; the disk write is throttled to ~30s (+ on quit). Demo mode
+        // keeps the legacy CSV-backed summaries so its scripted visuals are
+        // unchanged and fake sessions never enter the real tally.
         self.weekly_summary_tick += 1;
-        if self.weekly_summary_tick >= 15 {
-            self.weekly_summary_tick = 0;
-            self.weekly_summary = claudectl_core::history::weekly_summary();
-            self.all_time_summary = claudectl_core::history::all_time_summary();
-            self.daily_activity =
-                claudectl_core::history::daily_activity(claudectl_core::history::ACTIVITY_DAYS);
-            self.check_aggregate_budgets();
+        if self.demo_mode {
+            if self.weekly_summary_tick >= 15 {
+                self.weekly_summary_tick = 0;
+                self.weekly_summary = claudectl_core::history::weekly_summary();
+                self.all_time_summary = claudectl_core::history::all_time_summary();
+                self.daily_activity =
+                    claudectl_core::history::daily_activity(claudectl_core::history::ACTIVITY_DAYS);
+                self.check_aggregate_budgets();
+            }
+        } else {
+            for s in &self.sessions {
+                self.ledger.upsert(s);
+            }
+            self.weekly_summary = self.ledger.weekly_summary();
+            self.all_time_summary = self.ledger.all_time_summary();
+            self.daily_activity = self
+                .ledger
+                .daily_activity(claudectl_core::history::ACTIVITY_DAYS);
+            if self.weekly_summary_tick >= 15 {
+                self.weekly_summary_tick = 0;
+                if self.persist_enabled {
+                    self.ledger.save();
+                }
+                self.check_aggregate_budgets();
+            }
         }
 
         // Refresh coordination state every ~6s (3 ticks at 2s interval)
@@ -3431,31 +3480,28 @@ impl App {
         c
     }
 
-    /// Today/week/all-time cost + token totals with live (active-session) spend
-    /// folded into the CSV-backed history. See [`FleetTotals`].
+    /// Today/week/all-time cost + token totals, read straight from the
+    /// ledger-backed summaries. Live spend is already in those summaries (every
+    /// session is upserted into the ledger each tick), so there's no separate
+    /// "live fold" to add here. See [`FleetTotals`].
     pub fn fleet_totals(&self) -> FleetTotals {
-        // Live sessions not yet recorded to history. Exclude `Finished` — it may
-        // have just been written to the CSV, so counting it here would double it.
-        let mut live_cost = 0.0;
-        let mut live_tokens = 0u64;
-        for s in &self.sessions {
-            if s.status == SessionStatus::Finished {
-                continue;
-            }
-            live_cost += s.cost_usd;
-            live_tokens += s.total_input_tokens + s.total_output_tokens;
-        }
-
         let w = &self.weekly_summary;
         let a = &self.all_time_summary;
-        // Live spend belongs to today, this week, and all-time at once, so it adds
-        // to each (today ⊆ week ⊆ all — consistent, not double-counted).
         FleetTotals {
-            today_cost: w.today_cost_usd + live_cost,
-            week_cost: w.cost_usd + live_cost,
-            week_tokens: w.total_tokens + live_tokens,
-            all_cost: a.cost_usd + live_cost,
-            all_tokens: a.total_tokens + live_tokens,
+            today_cost: w.today_cost_usd,
+            week_cost: w.cost_usd,
+            week_tokens: w.total_tokens,
+            all_cost: a.cost_usd,
+            all_tokens: a.total_tokens,
+        }
+    }
+
+    /// Flush the persistent cost tally to disk. Called on quit so the final
+    /// interval's spend isn't lost between the ~30s throttled saves. No-op for a
+    /// non-persisting (test/demo) ledger.
+    pub fn save_tally(&mut self) {
+        if self.persist_enabled {
+            self.ledger.save();
         }
     }
 
@@ -3999,9 +4045,6 @@ pub struct ProjectGroup {
     /// Git status of the project dir (Phase 3 light path); `None` for the
     /// "(other)" bucket, non-git dirs, or when `git` is unavailable.
     pub git: Option<GitStatus>,
-    /// Actionability rank of the most-urgent agent (lower = more urgent); used to
-    /// float projects with a blocked agent to the top. `u8::MAX` when idle.
-    pub urgency: u8,
 }
 
 /// Short display name for a project path (its final component), for status text.
@@ -4038,8 +4081,6 @@ fn merge_discovered_session(prev: ClaudeSession, new: ClaudeSession) -> ClaudeSe
     }
 }
 
-/// Actionability rank for roster ordering (from agent-deck): a blocked agent is
-/// more urgent than a busy or expensive one. Lower sorts first.
 /// Title for a freshly launched agent's staged pane border: "Claude — <project>"
 /// from the launch path's final component.
 fn stage_title_for(path: &str) -> String {
@@ -4050,19 +4091,6 @@ fn stage_title_for(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("agent");
     format!("Claude \u{2014} {name}")
-}
-
-fn status_urgency(status: SessionStatus) -> u8 {
-    match status {
-        SessionStatus::NeedsInput => 0,
-        SessionStatus::Error => 1,
-        SessionStatus::Processing => 2,
-        SessionStatus::JobDone => 3,
-        SessionStatus::WaitingInput => 4,
-        SessionStatus::Idle => 5,
-        SessionStatus::Unknown => 6,
-        SessionStatus::Finished => 7,
-    }
 }
 
 impl ProjectGroup {
@@ -4087,11 +4115,6 @@ impl ProjectGroup {
 
     fn new(name: String, path: Option<PathBuf>, has_git: bool, members: &[&ClaudeSession]) -> Self {
         let (active_count, total_cost, avg_context_pct) = Self::aggregate(members);
-        let urgency = members
-            .iter()
-            .map(|s| status_urgency(s.status))
-            .min()
-            .unwrap_or(u8::MAX);
         Self {
             name,
             path,
@@ -4102,7 +4125,6 @@ impl ProjectGroup {
             total_cost,
             avg_context_pct,
             git: None,
-            urgency,
         }
     }
 }
@@ -4157,21 +4179,17 @@ impl App {
             ));
         }
 
-        // Projects hosting agents first, then by actionability (most-urgent agent
-        // — a NeedsInput beats a busy or merely expensive one), then cost desc,
-        // then name. Idle (zero-agent) projects sink below, ordered by name.
+        // Projects hosting agents float to the top, then **stable alphabetical by
+        // name** — both within the agent-bearing group and within the idle group
+        // below it. Deliberately NOT sorted by status/urgency/cost: once a repo has
+        // an agent it's pinned to the top band and its position there stays put as
+        // the agent's status churns (NeedsInput→Processing→Idle…), instead of
+        // re-floating on every tick. Ordering only shifts when a repo gains or loses
+        // its first/last agent.
         result.sort_by(|a, b| {
             let a_active = a.session_count > 0;
             let b_active = b.session_count > 0;
-            b_active
-                .cmp(&a_active)
-                .then_with(|| a.urgency.cmp(&b.urgency))
-                .then_with(|| {
-                    b.total_cost
-                        .partial_cmp(&a.total_cost)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.name.cmp(&b.name))
+            b_active.cmp(&a_active).then_with(|| a.name.cmp(&b.name))
         });
         result
     }
@@ -4488,13 +4506,37 @@ mod tests {
     }
 
     #[test]
-    fn fleet_totals_fold_live_spend_and_skip_finished() {
-        // BACKLOG "today/wk counters constantly 0": history.csv only holds Finished
-        // sessions, so a never-finished agent (and its sub-agents) showed nothing.
-        // fleet_totals folds live spend in; a Finished session is excluded (it may
-        // already be in the CSV — counting it here would double it).
+    fn fleet_totals_mirror_ledger_backed_summaries() {
+        // Totals now read straight from the ledger-backed summaries — live spend
+        // is already folded in there (every session is upserted each tick), so
+        // fleet_totals adds nothing and must mirror the summaries verbatim.
         let mut app = App::new();
-        let mut live = make_session(
+        app.weekly_summary = claudectl_core::history::WeeklySummary {
+            cost_usd: 5.0,
+            total_tokens: 5500,
+            today_cost_usd: 4.0,
+            ..Default::default()
+        };
+        app.all_time_summary = claudectl_core::history::AllTimeSummary {
+            cost_usd: 13.0,
+            total_tokens: 51_500,
+            ..Default::default()
+        };
+
+        let t = app.fleet_totals();
+        assert!((t.today_cost - 4.0).abs() < 1e-9);
+        assert!((t.week_cost - 5.0).abs() < 1e-9);
+        assert_eq!(t.week_tokens, 5500);
+        assert!((t.all_cost - 13.0).abs() < 1e-9);
+        assert_eq!(t.all_tokens, 51_500);
+    }
+
+    #[test]
+    fn ledger_includes_live_session_spend() {
+        // A live (never-finished) agent's cost lands in the totals via the ledger
+        // — the fix for the old "today/week counters constantly 0".
+        let mut app = App::new();
+        let live = make_session(
             1,
             "live",
             "sonnet-4.6",
@@ -4503,38 +4545,9 @@ mod tests {
             10.0,
             true,
         );
-        live.total_input_tokens = 1000;
-        live.total_output_tokens = 500;
-        let mut done = make_session(
-            2,
-            "done",
-            "sonnet-4.6",
-            SessionStatus::Finished,
-            9.0,
-            10.0,
-            true,
-        );
-        done.total_input_tokens = 9999;
-        done.total_output_tokens = 9999;
-        app.sessions = vec![live, done];
-        app.weekly_summary = claudectl_core::history::WeeklySummary {
-            cost_usd: 2.0,
-            total_tokens: 4000,
-            today_cost_usd: 1.0,
-            ..Default::default()
-        };
-        app.all_time_summary = claudectl_core::history::AllTimeSummary {
-            cost_usd: 10.0,
-            total_tokens: 50_000,
-            ..Default::default()
-        };
-
-        let t = app.fleet_totals();
-        assert!((t.today_cost - 4.0).abs() < 1e-9, "1.0 today + 3.0 live");
-        assert!((t.week_cost - 5.0).abs() < 1e-9, "2.0 wk + 3.0 live");
-        assert_eq!(t.week_tokens, 4000 + 1500, "wk tokens + live in+out");
-        assert!((t.all_cost - 13.0).abs() < 1e-9, "10.0 all + 3.0 live");
-        assert_eq!(t.all_tokens, 50_000 + 1500);
+        app.ledger.upsert(&live);
+        app.all_time_summary = app.ledger.all_time_summary();
+        assert!((app.fleet_totals().all_cost - 3.0).abs() < 1e-9);
     }
 
     fn make_test_app() -> App {

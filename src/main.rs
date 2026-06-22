@@ -188,6 +188,9 @@ fn run<W: io::Write>(
             match event::read()? {
                 Event::Key(key) => {
                     if !app.handle_key(key) {
+                        // Flush the running cost tally before we tear down, so the
+                        // last interval's spend persists across the restart.
+                        app.save_tally();
                         return Ok(());
                     }
                     needs_redraw = true;

@@ -2477,21 +2477,48 @@ impl App {
     fn handle_input_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                if let Some(pid) = self.input_target_pid {
-                    if let Some(session) = self.sessions.iter().find(|s| s.pid == pid) {
-                        // Log passive observation: user sent manual input
+                // Keystroke injection is a tmux-only backend; bail with a clear
+                // hint (and keep the draft) on a terminal that can't inject.
+                if !self.input_supported {
+                    self.status_msg =
+                        "Input needs tmux — run agents and herdr inside tmux (see ? help)".into();
+                    return;
+                }
+                let pid = self.input_target_pid;
+                let text = self.input_buffer.clone();
+                // Compute the result while borrowing `sessions`, so the borrow is
+                // dropped before we mutate `self` (status/input) below. The runtime
+                // is an inert mock, so real effects must go through `terminals`
+                // (see herdr-dormant-runtime) — the same path chat input uses.
+                let outcome = match pid.and_then(|p| self.sessions.iter().find(|s| s.pid == p)) {
+                    None => None,
+                    Some(s) if s.is_remote() => {
+                        Some(Err("Remote session — input not available".to_string()))
+                    }
+                    Some(s) => {
+                        // Log passive observation: user sent manual input.
                         let _ = self
                             .runtime
                             .actions
-                            .log_observation(observation_from(session, "user_input"));
-                        let text = format!("{}\n", self.input_buffer);
-                        match self.runtime.actions.inject_text(&session.session_id, &text) {
-                            Ok(()) => {
-                                self.status_msg = format!("Sent to {}", session.display_name())
-                            }
-                            Err(e) => self.status_msg = format!("Error: {e}"),
-                        }
+                            .log_observation(observation_from(s, "user_input"));
+                        let name = s.display_name().to_string();
+                        Some(
+                            terminals::send_input(s, &text)
+                                .and_then(|()| terminals::send_input(s, "\r"))
+                                .map(|()| name)
+                                .map_err(|e| format!("Send failed: {e}")),
+                        )
                     }
+                };
+                match outcome {
+                    // A failed send keeps the draft and input mode open so the
+                    // user can retry; only a clean send (or no target) closes.
+                    Some(Err(e)) => {
+                        self.status_msg = format!("Error: {e}");
+                        return;
+                    }
+                    Some(Ok(name)) => self.status_msg = format!("Sent to {name}"),
+                    None => {}
                 }
                 self.input_mode = false;
                 self.input_buffer.clear();

@@ -191,27 +191,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         match entry {
             RosterRow::Header(gi) => {
                 let group = &groups[*gi];
-                let cost_str = if group.total_cost < 1.0 {
-                    format!("${:.2}", group.total_cost)
-                } else {
-                    format!("${:.1}", group.total_cost)
-                };
-                // Idle projects (no agents) render as just the dim project name —
-                // the absence of child rows conveys "no agents", and the narrow
-                // Project column can't fit more. Git status gets its own column
-                // in the Phase 3 light path. Active projects show the aggregate.
-                let header_text = if group.session_count == 0 {
-                    group.name.clone()
-                } else {
-                    format!(
-                        "{} ({} sessions, {} active, {}, ctx {:.0}%)",
-                        group.name,
-                        group.session_count,
-                        group.active_count,
-                        cost_str,
-                        group.avg_context_pct
-                    )
-                };
+                // Just the project name. The per-session aggregate (sessions /
+                // active / cost / ctx) made the header bar too long; the branch
+                // glance and the all-time `Σ$` cost below carry the at-a-glance
+                // info worth keeping.
+                let header_text = group.name.clone();
                 let header_style = if group.session_count == 0 {
                     Style::default().fg(t.header).add_modifier(Modifier::DIM)
                 } else {
